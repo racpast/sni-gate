@@ -23,7 +23,7 @@ use tokio::sync::RwLock;
 use tokio::time::Instant;
 use tracing::{debug, warn};
 
-use crate::config::{EchConfig as EchSettings, EchMode as SourceMode};
+use crate::config::{EchMode as SourceMode, EffectiveEch};
 use crate::error::EchError;
 
 /// A resolved ECH client config plus its refresh deadline.
@@ -35,7 +35,7 @@ struct Cached {
 
 /// Per-route ECH provider, caching a client config per inner name.
 pub struct EchProvider {
-    settings: EchSettings,
+    settings: EffectiveEch,
     /// Fixed upstream port, used for RFC 9460 port-prefix HTTPS lookups.
     upstream_port: u16,
     require_ech: bool,
@@ -52,7 +52,7 @@ pub struct EchClient {
 
 impl EchProvider {
     pub fn new(
-        settings: EchSettings,
+        settings: EffectiveEch,
         upstream_port: u16,
         require_ech: bool,
         resolver: Arc<TokioResolver>,

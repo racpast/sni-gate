@@ -8,6 +8,8 @@
 //!   * `raw` route: the untouched byte stream is spliced to the backend.
 //!   * `raw` route with a port-only `upstream`: the matched source Host is
 //!     reflected as the dial target, with the configured port.
+//!   * named template: a route that carries only `match_sni` + `use` inherits
+//!     its `type`/`upstream` from a `[templates.*]` bundle and still works.
 //!   * WebSocket-style half-close: a request that half-closes still receives a
 //!     full response back (the regression fixed in the proxy splice).
 
@@ -174,12 +176,6 @@ addr = "127.0.0.1:{listen}"
 
 #[test]
 fn http_route_terminates_tls_and_issues_cert() {
-    use std::sync::Arc;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio_rustls::rustls::pki_types::ServerName;
-    use tokio_rustls::rustls::{ClientConfig, RootCertStore};
-    use tokio_rustls::TlsConnector;
-
     let dir = tempdir();
     let (backend, _bh) = spawn_mock_backend();
     let listen = free_port();
@@ -206,16 +202,63 @@ addr = "127.0.0.1:{listen}"
     );
     let _sg = spawn_sni_gate(&config, dir.path());
     wait_port(listen);
+    drive_tls_http(listen, &dir.path().join("ca").join("ca.crt"), "a.web.test");
+}
+
+#[test]
+fn template_supplies_type_and_upstream_end_to_end() {
+    // A `[templates.web]` provides `type` and `upstream`; the route carries only
+    // `match_sni` + `use`. Proves templates flow through the real binary and its
+    // load-time validation, and that TLS is still terminated with an issued cert.
+    let dir = tempdir();
+    let (backend, _bh) = spawn_mock_backend();
+    let listen = free_port();
+    let config = format!(
+        r#"
+[global]
+resolver = "system"
+unmatched = "close"
+[ca]
+cert_path = "ca/ca.crt"
+key_path = "ca/ca.key"
+common_name = "E2E CA"
+leaf_validity_days = 90
+[cache.psl]
+source = "embedded"
+[templates.web]
+type = "http"
+upstream = "127.0.0.1:{backend}"
+[[listener]]
+addr = "127.0.0.1:{listen}"
+  [[listener.route]]
+  name = "templated"
+  use = "web"
+  match_sni = [".web.test"]
+"#
+    );
+    let _sg = spawn_sni_gate(&config, dir.path());
+    wait_port(listen);
+    drive_tls_http(listen, &dir.path().join("ca").join("ca.crt"), "a.web.test");
+}
+
+/// Connect to `listen` over TLS presenting `sni`, trusting the CA that sni-gate
+/// generates at `ca_path`, send an HTTP request, and assert a `200 OK` comes
+/// back — i.e. the cert was issued+trusted and the request reached the backend.
+fn drive_tls_http(listen: u16, ca_path: &std::path::Path, sni: &'static str) {
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::rustls::pki_types::ServerName;
+    use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+    use tokio_rustls::TlsConnector;
 
     // Wait for the CA to be generated on disk, then trust it.
-    let ca_path = dir.path().join("ca").join("ca.crt");
     for _ in 0..100 {
         if ca_path.exists() {
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    let ca_pem = std::fs::read(&ca_path).expect("CA cert generated");
+    let ca_pem = std::fs::read(ca_path).expect("CA cert generated");
 
     let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
 
@@ -233,21 +276,18 @@ addr = "127.0.0.1:{listen}"
         let tcp = tokio::net::TcpStream::connect(("127.0.0.1", listen))
             .await
             .unwrap();
-        // SNI "a.web.test" — sni-gate must issue a cert for it, verifiable by
-        // our trust of the CA, and route to the backend.
-        let name = ServerName::try_from("a.web.test").unwrap();
+        let name = ServerName::try_from(sni).unwrap();
         let mut tls = connector
             .connect(name, tcp)
             .await
             .expect("TLS handshake (cert issued + trusted)");
 
-        tls.write_all(b"GET / HTTP/1.1\r\nHost: a.web.test\r\nConnection: close\r\n\r\n")
-            .await
-            .unwrap();
+        let req = format!("GET / HTTP/1.1\r\nHost: {sni}\r\nConnection: close\r\n\r\n");
+        tls.write_all(req.as_bytes()).await.unwrap();
         let mut resp = Vec::new();
         tls.read_to_end(&mut resp).await.unwrap();
         let resp = String::from_utf8_lossy(&resp);
-        assert!(resp.contains("200 OK"), "http route via TLS: {resp:?}");
+        assert!(resp.contains("200 OK"), "TLS route response: {resp:?}");
     });
 }
 

@@ -253,12 +253,31 @@ fn build_route(
     root_store: &Arc<RootCertStore>,
     resolver_cache: &mut ResolverCache,
 ) -> Result<RouteRuntime> {
-    let eff = cfg.effective(listener, route);
-    // Defaulted upstream parts resolve against this listener's port; a `None`
-    // host reflects the matched source SNI/Host per connection.
-    let (host, port) = route
-        .resolved_upstream(listener.addr.port())
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Templates were validated at load, so name lookups cannot fail here.
+    let rt_tpl = cfg.template_for(&route.use_template)?;
+    let ln_tpl = cfg.template_for(&listener.use_template)?;
+
+    let eff = cfg.effective(listener, route, rt_tpl, ln_tpl);
+
+    // Concrete protocol type (route → template), guaranteed present by validation.
+    let route_type = Config::effective_route_type(route, rt_tpl)
+        .ok_or_else(|| anyhow::anyhow!("route {}: missing type", route.label()))?;
+
+    // Upstream comes from the route or its template (route scope only). Defaulted
+    // parts resolve against this listener's port; a `None` host reflects the
+    // matched source SNI/Host per connection.
+    let upstream_spec = route
+        .upstream
+        .as_deref()
+        .or_else(|| rt_tpl.and_then(|t| t.upstream.as_deref()));
+    let (host, port) = config::resolved_upstream_from(upstream_spec, listener.addr.port())
+        .ok_or_else(|| anyhow::anyhow!("route {}: invalid upstream", route.label()))?;
+
+    // SNI presented upstream: route → template (deeper wins).
+    let override_sni = route
+        .override_sni
+        .clone()
+        .or_else(|| rt_tpl.and_then(|t| t.override_sni.clone()));
 
     // NAT64 disabled in ipv6-only mode.
     let nat64 = match (&eff.nat64_prefix, eff.address_family) {
@@ -273,16 +292,13 @@ fn build_route(
     let addr_spec = eff.addr_resolver.clone().unwrap_or_default();
     let addr_resolver = get_resolver(resolver_cache, &addr_spec, eff.address_family)?;
 
-    let ech = if route.route_type == RouteType::Ech {
-        let settings = route
-            .ech
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("route {}: type=ech requires [ech]", route.label()))?;
+    let eff_ech = cfg.effective_ech(listener, route, rt_tpl, ln_tpl);
+    let ech = if route_type == RouteType::Ech {
         let ech_spec = eff.ech_resolver.clone().unwrap_or_default();
         // HTTPS records are resolved dual-family regardless of upstream family.
         let ech_resolver = get_resolver(resolver_cache, &ech_spec, config::AddressFamily::Dual)?;
         Some(EchProvider::new(
-            settings,
+            eff_ech.clone(),
             port,
             eff.require_ech,
             ech_resolver,
@@ -293,16 +309,14 @@ fn build_route(
         None
     };
 
-    let max_retries = route.ech.as_ref().and_then(|e| e.max_retries).unwrap_or(2);
-
     Ok(RouteRuntime {
         name: route.label(),
-        route_type: route.route_type,
+        route_type,
         upstream_host: host,
         upstream_port: port,
-        override_sni: route.override_sni.clone(),
+        override_sni,
         require_ech: eff.require_ech,
-        max_retries,
+        max_retries: eff_ech.max_retries,
         connect_timeout: eff.connect_timeout,
         idle_timeout: eff.idle_timeout,
         address_family: eff.address_family,

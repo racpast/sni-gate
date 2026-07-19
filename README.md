@@ -74,10 +74,12 @@ nothing to reflect).
 
 ## Hierarchical configuration
 
-Overridable settings resolve from the most specific scope outward:
+Overridable settings resolve from the most specific scope outward, with each
+scope's optional template sitting just below that scope's own explicit values:
 
 ```
-route.ech  →  route  →  listener  →  global
+route (explicit)  →  route's template  →  listener (explicit)  →
+listener's template  →  global
 ```
 
 An unset value at a deeper scope inherits the next one out. This applies to
@@ -85,6 +87,42 @@ An unset value at a deeper scope inherits the next one out. This applies to
 `ech_refresh`, `require_ech`, `connect_timeout`, `idle_timeout`, and the fail
 policy. So you can set, say, a different `addr_resolver` or `nat64_prefix` on a
 single route while everything else inherits the global value.
+
+The entire **`[ech]` block inherits field-by-field along the same ladder**:
+`mode`, `config`, `ech_domain`, `max_retries` (and `require_ech` / `ech_refresh`
+/ `ech_resolver`) each resolve independently. Put the shared parts in
+`[global.ech]` (or `[listener.ech]`) once and let each ECH route override only
+what differs — a route may even omit `[ech]` entirely and inherit the whole thing.
+
+## Templates
+
+A `[templates.<name>]` table is a reusable bundle of settings referenced by a
+single `use = "<name>"` on a `route`, `default_route`, or `listener`:
+
+```toml
+[templates.ech-edge]
+type = "ech"
+  [templates.ech-edge.ech]
+  mode = "doh"
+  ech_domain = "ech.example"
+
+[[listener]]
+addr = "0.0.0.0:443"
+  [[listener.route]]
+  match_sni = [".site-b.example", ".site-c.example"]
+  use = "ech-edge"
+  address_family = "ipv4"
+  nat64_prefix = "64:ff9b::"
+```
+
+A template may carry every reusable field — `type`, `upstream`, `override_sni`,
+the pinned `cert_file`/`key_file`, a whole `[ech]` block, `fail`, and all the
+overridable knobs — but not the route *identity* (`name`, `match_sni`). It sits
+in the ladder just below its scope's explicit values (see above), so a route's
+own setting always wins over its template. Each scope references at most one
+template, and templates cannot reference other templates (no nesting). An
+unknown template name is a load-time error. `upstream` in a template only
+applies when the template is used by a *route* (listeners have no upstream).
 
 ## DNS resolvers
 
@@ -113,13 +151,19 @@ independently overridable per scope.
 
 ## ECH
 
-For `type = "ech"` routes, the ECHConfigList is sourced by `[listener.route.ech]`:
+For `type = "ech"` routes, the ECHConfigList is sourced by an `[ech]` block. Its
+fields inherit field-by-field from `[listener.ech]` and `[global.ech]` (and any
+template), so shared settings need to be written only once; a route's `[ech]`
+overrides only what differs, and may be omitted entirely when the enclosing
+scopes already provide a complete config:
 - `mode = "static"` — a fixed inline base64 `config`.
 - `mode = "doh"` — looked up in the HTTPS record of `ech_domain` (or the inner
   name) via the ECH resolver; refreshed on `ech_refresh` / the record TTL.
 - `mode = "doh-with-fallback"` — DoH, falling back to the inline `config`.
 
-The upstream certificate is verified against the **inner (true) name** using the
+An omitted `mode` inherits (it is *not* silently `doh`); `static` and
+`doh-with-fallback` require a `config` to be resolvable from some scope, checked
+at load time. The upstream certificate is verified against the **inner (true) name** using the
 web-PKI roots. `require_ech` (default true) fails closed unless ECH is
 negotiated. **ECH retry**: if the server rejects ECH (its key rotated), the
 cached config is invalidated, a fresh one is fetched, and the handshake is

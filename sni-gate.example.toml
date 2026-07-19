@@ -5,7 +5,11 @@
 #
 # Model: [global] defaults → [[listener]] (one per inbound port) → each
 # listener's [[listener.route]] rules + optional [listener.default_route].
-# Overridable settings inherit outward: route.ech → route → listener → global.
+# Overridable settings inherit outward, each scope's `use = "…"` template just
+# below its explicit values:
+#   route → route's template → listener → listener's template → global
+# The whole [ech] block inherits field-by-field along the same ladder, so shared
+# ECH settings live once in [global.ech] / [listener.ech] / a template.
 
 # ---------------------------------------------------------------------------
 # Global defaults (outermost fallback scope)
@@ -19,7 +23,7 @@ log = "info"                                   # or SNI_GATE_LOG / RUST_LOG
 #   "https://host[:port]/dns-query"   DoH
 #   "tls://host[:port]"               DoT
 #   "udp://ip[:port]" | "ip[:port]"   plain DNS to an IP
-resolver = "https://1.1.1.1/dns-query"
+resolver = "system"                            # e.g. "https://dns.example/dns-query"
 # ech_resolver / addr_resolver may override the generic resolver per purpose.
 ech_refresh = "1h"                             # ECH config refresh bound
 # nat64_prefix = "64:ff9b::"                   # /96 prefix, hierarchical
@@ -28,6 +32,28 @@ ech_refresh = "1h"                             # ECH config refresh bound
 # a table:  unmatched = "close"  |  "system-outbound"  |
 #           { mode = "passthrough", addr = "127.0.0.1:80" }
 unmatched = "close"
+
+# Shared [ech] defaults, inherited field-by-field by every ECH route that does
+# not override them. A route may then omit [ech] entirely or set just one field.
+[global.ech]
+mode = "doh"                                   # static | doh | doh-with-fallback
+ech_domain = "ech.example"                     # HTTPS record carrying `ech=`
+require_ech = true
+# max_retries = 2                              # ECH-reject retries
+
+# ---------------------------------------------------------------------------
+# Named templates (reusable bundles referenced by `use = "<name>"`)
+# ---------------------------------------------------------------------------
+# A template may carry any reusable field (type, upstream, override_sni,
+# cert/key, a whole [ech] block, fail, and the overridable knobs) — but not the
+# route identity (name, match_sni). It sits just below its scope's explicit
+# values in the ladder. One `use` per scope; templates cannot use other
+# templates. `upstream` in a template applies only when used by a route.
+[templates.ech-edge]
+type = "ech"
+address_family = "ipv4"
+nat64_prefix = "64:ff9b::"    # RFC 6052 well-known /96 (use your own if you have one)
+# Inherits mode/ech_domain/require_ech from [global.ech]; override here if needed.
 
 # ---------------------------------------------------------------------------
 # Certificate authority (dynamic per-SNI issuance on TLS termination)
@@ -69,45 +95,47 @@ addr = "0.0.0.0:443"
 connect_timeout = "5s"
 
   # `upstream` may default either part. Forms:
-  #   "host:port"  fixed host and port (IPv6 in brackets: "[2a01:4f8::1]:443")
+  #   "host:port"  fixed host and port (IPv6 in brackets: "[2001:db8::1]:443")
   #   "host"       fixed host; port = this listener's port
   #   "8443"       port only; host = the matched source SNI/Host
   #   (omitted)    host = the matched source SNI/Host; port = this listener's port
   # A defaulted host reflects the routing key (inbound SNI/Host, port-stripped)
   # per connection; override_sni does not change the dial target.
 
-  # ECH re-origination: hide the true SNI from the path to the CDN edge.
+  # ECH re-origination: hide the true SNI from the path to the CDN edge. This
+  # route pins a full inline (static) ECHConfig, overriding the [global.ech] doh
+  # default.
   [[listener.route]]
-  name = "wnacg"
+  name = "site-a"
   type = "ech"
-  match_sni = [".wnacg.com"]         # exact | *.x | .x (suffix) | ~regex
-  upstream = "cdn.rpnet.cc:443"
-  # override_sni = "real.inner.site" # inner (protected) SNI; unset = inbound SNI
+  match_sni = [".site-a.example"]    # exact | *.x | .x (suffix) | ~regex
+  upstream = "edge.example:443"
+  # override_sni = "real.inner.example" # inner (protected) SNI; unset = inbound SNI
   # nat64_prefix / addr_resolver / ech_resolver may be set here, per route.
 
     [listener.route.ech]
-    mode = "static"                  # static | doh | doh-with-fallback
-    config = "AEX+DQBBsQAgACBb5UPmgfmO14XgxYAbwMJAXBjSXYN/RxMaV8zIMT4dGAAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA="
-    require_ech = true
-    max_retries = 2
+    mode = "static"                  # override the global "doh" default
+    config = "<base64 ECHConfigList>"
+
+  # These two collapse to just match_sni (+ use): type comes from the `ech-edge`
+  # template, and mode/ech_domain/require_ech from [global.ech].
+  # `upstream` omitted → reflect to <matched SNI>:443 (this listener's port).
+  [[listener.route]]
+  name = "grouped"
+  use = "ech-edge"
+  match_sni = [".site-b.example", ".site-c.example"]
 
   [[listener.route]]
-  name = "wnacg-doh"
-  type = "ech"
-  match_sni = [".example.com"]
-  upstream = "127.0.0.1:80"
-
-    [listener.route.ech]
-    mode = "doh"
-    ech_domain = "cloudflare-ech.com"  # name whose HTTPS record carries ech=
-    ech_refresh = "20min"
-    require_ech = true
+  name = "site-d"
+  use = "ech-edge"
+  match_sni = [".site-d.example"]
+  upstream = "127.0.0.1:80"          # override the reflecting default
 
   # Plain TLS upstream with an overridden SNI.
   [[listener.route]]
   name = "direct"
   type = "tls"
-  match_sni = ["*.direct.com"]
+  match_sni = ["*.direct.example"]
   upstream = "127.0.0.1:8866"
   override_sni = "backend.internal"
 
@@ -115,7 +143,7 @@ connect_timeout = "5s"
   [[listener.route]]
   name = "plain"
   type = "http"
-  match_sni = ["plain.local"]
+  match_sni = ["plain.example"]
   upstream = "127.0.0.1:8080"
 
   # Catch-all for SNI/Host matching no route above.
@@ -135,7 +163,7 @@ connect_timeout = "5s"
   [[listener.route]]
   name = "raw-a"
   type = "raw"
-  match_sni = [".a.com"]
+  match_sni = [".raw.example"]
   upstream = "127.0.0.1:5553"
 
   # Reflect: splice each connection back to its own SNI/Host on this listener's
@@ -144,4 +172,4 @@ connect_timeout = "5s"
   [[listener.route]]
   name = "reflect"
   type = "raw"
-  match_sni = [".mirror.com"]
+  match_sni = [".mirror.example"]

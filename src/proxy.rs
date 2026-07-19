@@ -38,7 +38,9 @@ const COPY_BUF_SIZE: usize = 64 * 1024;
 pub struct RouteRuntime {
     pub name: String,
     pub route_type: RouteType,
-    pub upstream_host: String,
+    /// Fixed upstream host, or `None` to reflect the matched source SNI/Host
+    /// (the port-stripped routing key) per connection.
+    pub upstream_host: Option<String>,
     pub upstream_port: u16,
     pub override_sni: Option<String>,
     pub require_ech: bool,
@@ -114,19 +116,27 @@ async fn dispatch(client: TcpStream, peer: SocketAddr, state: &ListenerState) ->
         None => key.map(strip_port),
     };
 
+    // Effective dial host: the fixed upstream host, else the matched source
+    // SNI/Host (port-stripped). `None` here means the route reflects but the
+    // connection carried no SNI/Host — handled at dial time per route type.
+    let dial_host = match rt.upstream_host.as_deref() {
+        Some(fixed) => Some(fixed.to_string()),
+        None => key.map(strip_port),
+    };
+
     debug!(%peer, route = %rt.name, key = key.unwrap_or("<none>"), tls = inbound.is_tls(), "routed");
 
     // raw: never terminate, never issue a cert — splice the untouched stream.
     if rt.route_type == RouteType::Raw {
-        return raw_passthrough(client, peer, rt, &inbound).await;
+        return raw_passthrough(client, peer, rt, &inbound, dial_host).await;
     }
 
     // Everything else terminates inbound TLS (plaintext HTTP is spliced as-is).
     let result = if inbound.is_tls() {
-        serve_terminated(client, peer, rt, state, sni).await
+        serve_terminated(client, peer, rt, state, sni, dial_host).await
     } else {
         // Cleartext inbound: no TLS to terminate; forward per route type.
-        serve_plaintext(client, peer, rt, sni).await
+        serve_plaintext(client, peer, rt, sni, dial_host).await
     };
 
     // On failure, honor the route's fail policy where it makes sense.
@@ -144,11 +154,12 @@ async fn serve_terminated(
     rt: &RouteRuntime,
     state: &ListenerState,
     sni: Option<String>,
+    dial_host: Option<String>,
 ) -> Result<()> {
     let acceptor = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), client);
     let start = acceptor.await?;
     let tls = start.into_stream(state.tls_server_config.clone()).await?;
-    forward(tls, peer, rt, sni).await
+    forward(tls, peer, rt, sni, dial_host).await
 }
 
 /// Forward a cleartext inbound connection (no inbound TLS).
@@ -157,8 +168,9 @@ async fn serve_plaintext(
     peer: SocketAddr,
     rt: &RouteRuntime,
     sni: Option<String>,
+    dial_host: Option<String>,
 ) -> Result<()> {
-    forward(client, peer, rt, sni).await
+    forward(client, peer, rt, sni, dial_host).await
 }
 
 /// Dial the upstream per route type and splice bytes.
@@ -167,19 +179,31 @@ async fn forward<S>(
     peer: SocketAddr,
     rt: &RouteRuntime,
     sni: Option<String>,
+    dial_host: Option<String>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // Concrete host to dial: the fixed upstream host, or the reflected source
+    // SNI/Host. Absent only when the route reflects and the connection carried
+    // no SNI/Host to reflect.
+    let host = dial_host.ok_or_else(|| {
+        anyhow!(
+            "route {} reflects the source SNI/Host upstream, but the connection \
+             presented none",
+            rt.name
+        )
+    })?;
+
     let upstream_addr = resolve_upstream(
         &rt.addr_resolver,
-        &rt.upstream_host,
+        &host,
         rt.upstream_port,
         rt.address_family,
         rt.nat64.as_ref(),
     )
     .await
-    .with_context(|| format!("resolving upstream {}", rt.upstream_host))?;
+    .with_context(|| format!("resolving upstream {host}"))?;
 
     match rt.route_type {
         RouteType::Http => {
@@ -187,7 +211,7 @@ where
             splice(inbound, up, rt.idle_timeout).await
         }
         RouteType::Tls => {
-            let name = sni.clone().unwrap_or_else(|| rt.upstream_host.clone());
+            let name = sni.clone().unwrap_or_else(|| host.clone());
             let up = dial_tls(upstream_addr, &name, rt).await?;
             splice(inbound, up, rt.idle_timeout).await
         }
@@ -387,11 +411,19 @@ async fn raw_passthrough(
     peer: SocketAddr,
     rt: &RouteRuntime,
     inbound: &Inbound,
+    dial_host: Option<String>,
 ) -> Result<()> {
     let dialed = async {
+        let host = dial_host.ok_or_else(|| {
+            anyhow!(
+                "route {} reflects the source SNI/Host upstream, but the \
+                 connection presented none",
+                rt.name
+            )
+        })?;
         let upstream_addr = resolve_upstream(
             &rt.addr_resolver,
-            &rt.upstream_host,
+            &host,
             rt.upstream_port,
             rt.address_family,
             rt.nat64.as_ref(),

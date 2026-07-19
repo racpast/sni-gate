@@ -254,8 +254,10 @@ fn build_route(
     resolver_cache: &mut ResolverCache,
 ) -> Result<RouteRuntime> {
     let eff = cfg.effective(listener, route);
+    // Defaulted upstream parts resolve against this listener's port; a `None`
+    // host reflects the matched source SNI/Host per connection.
     let (host, port) = route
-        .upstream_host_port()
+        .resolved_upstream(listener.addr.port())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // NAT64 disabled in ipv6-only mode.

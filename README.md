@@ -52,6 +52,26 @@ It merges two capabilities:
 verbatim; set = force that name. For `ech` it is the inner (protected) name; for
 `tls` it is the SNI presented to the upstream.
 
+## Upstream address
+
+`upstream` names the target to dial. Either part may be defaulted:
+
+| `upstream`          | dial host                       | dial port            |
+|---------------------|---------------------------------|----------------------|
+| `"host:port"`       | fixed host (IPv6 in `[...]`)    | fixed port           |
+| `"host"`            | fixed host                      | this listener's port |
+| `"8443"`            | matched source SNI/Host         | `8443`               |
+| *(omitted)*         | matched source SNI/Host         | this listener's port |
+
+When the host is defaulted it is the **matched source SNI/Host** — the routing
+key the connection matched on (the inbound SNI or Host, with any `:port`
+stripped), resolved per connection. This "reflects" each connection back to its
+own name, so a listener can forward every matched name to that same name
+upstream without a per-route host. `override_sni` does **not** change the dial
+target; it only sets the upstream TLS server name for `tls`/`ech`. A connection
+routed to a reflecting route that carries no SNI/Host is closed (there is
+nothing to reflect).
+
 ## Hierarchical configuration
 
 Overridable settings resolve from the most specific scope outward:

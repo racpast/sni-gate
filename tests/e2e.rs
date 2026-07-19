@@ -6,6 +6,8 @@
 //!   * `http` route: TLS is terminated (a cert is issued by the local CA) and
 //!     the plaintext request reaches the backend with its Host header intact.
 //!   * `raw` route: the untouched byte stream is spliced to the backend.
+//!   * `raw` route with a port-only `upstream`: the matched source Host is
+//!     reflected as the dial target, with the configured port.
 //!   * WebSocket-style half-close: a request that half-closes still receives a
 //!     full response back (the regression fixed in the proxy splice).
 
@@ -123,6 +125,51 @@ addr = "127.0.0.1:{listen}"
     let mut resp = String::new();
     s.read_to_string(&mut resp).unwrap();
     assert!(resp.contains("200 OK"), "raw route response: {resp:?}");
+}
+
+#[test]
+fn raw_route_reflects_source_host_with_port_only_upstream() {
+    // `upstream = "<port>"` reflects the matched source SNI/Host to that fixed
+    // port. To stay hermetic (no DNS), the routing key is a literal IP —
+    // `resolve_upstream` dials a literal host without any lookup — so we match
+    // on "127.0.0.1" and connect with `Host: 127.0.0.1`. The dial host becomes
+    // 127.0.0.1 (reflected) and the port becomes the mock backend's port.
+    let dir = tempdir();
+    let (backend, _bh) = spawn_mock_backend();
+    let listen = free_port();
+    let config = format!(
+        r#"
+[global]
+resolver = "system"
+unmatched = "close"
+[ca]
+cert_path = "ca/ca.crt"
+key_path = "ca/ca.key"
+common_name = "E2E CA"
+leaf_validity_days = 90
+[cache.psl]
+source = "embedded"
+[[listener]]
+addr = "127.0.0.1:{listen}"
+  [[listener.route]]
+  name = "reflect"
+  type = "raw"
+  match_sni = ["127.0.0.1"]
+  upstream = "{backend}"
+"#
+    );
+    let _sg = spawn_sni_gate(&config, dir.path());
+    wait_port(listen);
+
+    let mut s = TcpStream::connect(("127.0.0.1", listen)).unwrap();
+    s.write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).unwrap();
+    assert!(
+        resp.contains("200 OK"),
+        "reflected port-only upstream response: {resp:?}"
+    );
 }
 
 #[test]

@@ -68,6 +68,14 @@ source = "embedded"           # embedded | file | network
 addr = "0.0.0.0:443"
 connect_timeout = "5s"
 
+  # `upstream` may default either part. Forms:
+  #   "host:port"  fixed host and port (IPv6 in brackets: "[2a01:4f8::1]:443")
+  #   "host"       fixed host; port = this listener's port
+  #   "8443"       port only; host = the matched source SNI/Host
+  #   (omitted)    host = the matched source SNI/Host; port = this listener's port
+  # A defaulted host reflects the routing key (inbound SNI/Host, port-stripped)
+  # per connection; override_sni does not change the dial target.
+
   # ECH re-origination: hide the true SNI from the path to the CDN edge.
   [[listener.route]]
   name = "wnacg"
@@ -129,3 +137,11 @@ connect_timeout = "5s"
   type = "raw"
   match_sni = [".a.com"]
   upstream = "127.0.0.1:5553"
+
+  # Reflect: splice each connection back to its own SNI/Host on this listener's
+  # port (8443). `upstream` is omitted. Set `upstream = "9000"` to reflect to
+  # <SNI/Host>:9000 instead.
+  [[listener.route]]
+  name = "reflect"
+  type = "raw"
+  match_sni = [".mirror.com"]

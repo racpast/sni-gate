@@ -128,8 +128,20 @@ pub struct Route {
     #[serde(default)]
     pub match_sni: Vec<String>,
 
-    /// Upstream to dial, `host:port` (IPv6 in brackets). Host may be a name.
-    pub upstream: String,
+    /// Upstream to dial. Both the host and the port may be defaulted:
+    ///
+    ///   * `"host:port"`  — fixed host and port (IPv6 in brackets).
+    ///   * `"host"`       — fixed host; port = this listener's port.
+    ///   * `"8443"`       — port only; host = the matched source SNI/Host.
+    ///   * *(omitted)*    — host = the matched source SNI/Host; port = this
+    ///     listener's port.
+    ///
+    /// When the host is defaulted it is the *routing key* the connection was
+    /// matched on (the inbound SNI/Host, port-stripped) — resolved per
+    /// connection. `override_sni` does not affect the dial target; it only sets
+    /// the upstream TLS server name for `tls`/`ech`.
+    #[serde(default)]
+    pub upstream: Option<String>,
 
     /// SNI sent to the upstream. Unset = use the inbound SNI verbatim. For
     /// `ech` routes this is the inner (protected) name; for `tls` the SNI on
@@ -484,11 +496,12 @@ impl Config {
                     )));
                 }
             }
+            let port = a.addr.port();
             for r in &a.routes {
-                r.validate(false)?;
+                r.validate(false, port)?;
             }
             if let Some(d) = &a.default_route {
-                d.validate(true)?;
+                d.validate(true, port)?;
             }
         }
         if self.ca.leaf_validity_days < 1 {
@@ -597,25 +610,44 @@ impl Route {
             .unwrap_or_else(|| format!("{:?}", self.route_type).to_lowercase())
     }
 
-    /// Split `upstream` into (host, port). IPv6 hosts use bracket notation.
-    pub fn upstream_host_port(&self) -> Result<(String, u16), ConfigError> {
-        split_host_port(&self.upstream).ok_or_else(|| {
+    /// Resolve `upstream` against `listener_port`, filling in the defaulted
+    /// pieces. Returns `(host, port)` where `host` is `None` when it should be
+    /// taken from the matched source SNI/Host at connection time (dynamic).
+    ///
+    ///   * absent           → `(None, listener_port)`
+    ///   * `"8443"`         → `(None, 8443)`
+    ///   * `"host"`         → `(Some(host), listener_port)`
+    ///   * `"host:port"`    → `(Some(host), port)`
+    pub fn resolved_upstream(
+        &self,
+        listener_port: u16,
+    ) -> Result<(Option<String>, u16), ConfigError> {
+        let Some(spec) = self.upstream.as_deref() else {
+            return Ok((None, listener_port));
+        };
+        let parsed = parse_upstream(spec).ok_or_else(|| {
             ConfigError::Invalid(format!(
                 "route {}: invalid upstream {:?}",
                 self.label(),
-                self.upstream
+                spec
             ))
-        })
+        })?;
+        Ok((parsed.host, parsed.port.unwrap_or(listener_port)))
     }
 
-    fn validate(&self, is_default: bool) -> Result<(), ConfigError> {
-        if self.upstream.trim().is_empty() {
-            return Err(ConfigError::Invalid(format!(
-                "route {}: upstream must not be empty",
-                self.label()
-            )));
+    fn validate(&self, is_default: bool, listener_port: u16) -> Result<(), ConfigError> {
+        // `upstream` may be omitted (dynamic host + listener port). When set, it
+        // must parse; an explicitly empty/whitespace string is a mistake.
+        if let Some(spec) = self.upstream.as_deref() {
+            if spec.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "route {}: upstream, when set, must not be empty (omit it to \
+                     reflect the source SNI/Host to this listener's port)",
+                    self.label()
+                )));
+            }
         }
-        self.upstream_host_port()?;
+        self.resolved_upstream(listener_port)?;
         if !is_default && self.match_sni.is_empty() {
             return Err(ConfigError::Invalid(format!(
                 "route {}: match_sni needs at least one pattern (or use default_route)",
@@ -674,6 +706,57 @@ pub fn split_host_port(s: &str) -> Option<(String, u16)> {
         }
         Some((host.to_string(), port.parse().ok()?))
     }
+}
+
+/// A parsed `upstream` value with independently-optional host and port.
+///
+/// `host = None` means "use the matched source SNI/Host"; `port = None` means
+/// "use the parent listener's port". The two are resolved by
+/// [`Route::resolved_upstream`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamSpec {
+    pub host: Option<String>,
+    pub port: Option<u16>,
+}
+
+/// Parse a non-empty `upstream` value into an [`UpstreamSpec`].
+///
+/// Accepted forms (after trimming):
+///   * `"8443"`        — a bare port (all digits): host defaulted, port fixed.
+///   * `"host:port"`   — a DNS name or IPv4 with a port.
+///   * `"[v6]:port"`   — an IPv6 literal in brackets with a port.
+///   * `"host"`        — a bare host with no port: port defaulted.
+///
+/// A bare, unbracketed IPv6 literal is rejected (ambiguous — must use `[v6]`),
+/// as are malformed ports. Returns `None` on any unrecognized input. The empty
+/// string is *not* a valid spec here; omit the field to default both parts.
+pub fn parse_upstream(s: &str) -> Option<UpstreamSpec> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // A bare port (all digits) defaults the host. Checked first because a value
+    // like "443" is both a valid u16 and a colon-free "host".
+    if s.bytes().all(|b| b.is_ascii_digit()) {
+        return Some(UpstreamSpec {
+            host: None,
+            port: Some(s.parse().ok()?),
+        });
+    }
+    // A colon (bracketed or not) means an explicit port is present; delegate to
+    // the strict host:port / [v6]:port parser.
+    if s.contains(':') {
+        let (host, port) = split_host_port(s)?;
+        return Some(UpstreamSpec {
+            host: Some(host),
+            port: Some(port),
+        });
+    }
+    // Otherwise a bare host with no port; the port defaults to the listener's.
+    Some(UpstreamSpec {
+        host: Some(s.to_string()),
+        port: None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -766,6 +849,79 @@ mod tests {
         assert_eq!(split_host_port("a.com:bad"), None);
         // A bracketed non-IPv6 is rejected.
         assert_eq!(split_host_port("[not-v6]:443"), None);
+    }
+
+    #[test]
+    fn parse_upstream_variants() {
+        let spec = |host: Option<&str>, port: Option<u16>| {
+            Some(UpstreamSpec {
+                host: host.map(str::to_string),
+                port,
+            })
+        };
+        // Bare port: host defaulted, port fixed.
+        assert_eq!(parse_upstream("8443"), spec(None, Some(8443)));
+        assert_eq!(parse_upstream("443"), spec(None, Some(443)));
+        // Bare host: port defaulted.
+        assert_eq!(
+            parse_upstream("cdn.example.com"),
+            spec(Some("cdn.example.com"), None)
+        );
+        // host:port and IPv4:port.
+        assert_eq!(parse_upstream("a.com:443"), spec(Some("a.com"), Some(443)));
+        assert_eq!(
+            parse_upstream("1.2.3.4:8443"),
+            spec(Some("1.2.3.4"), Some(8443))
+        );
+        // Bracketed IPv6 with a port.
+        assert_eq!(
+            parse_upstream("[2a01:4f8::1]:443"),
+            spec(Some("2a01:4f8::1"), Some(443))
+        );
+        // Surrounding whitespace is tolerated.
+        assert_eq!(parse_upstream("  9000  "), spec(None, Some(9000)));
+        // Rejected: empty, bare v6, bad port, port overflow, bracketed non-v6.
+        assert_eq!(parse_upstream(""), None);
+        assert_eq!(parse_upstream("   "), None);
+        assert_eq!(parse_upstream("2a01:4f8::1:443"), None);
+        assert_eq!(parse_upstream("a.com:bad"), None);
+        assert_eq!(parse_upstream("99999"), None);
+        assert_eq!(parse_upstream("[not-v6]:443"), None);
+    }
+
+    #[test]
+    fn resolved_upstream_defaults() {
+        let route = |upstream: Option<&str>| Route {
+            name: None,
+            route_type: RouteType::Raw,
+            match_sni: vec![".x.com".into()],
+            upstream: upstream.map(str::to_string),
+            override_sni: None,
+            ech: None,
+            cert_file: None,
+            key_file: None,
+            common: CommonOpts::default(),
+            fail: None,
+        };
+        // Omitted: dynamic host, listener port.
+        assert_eq!(route(None).resolved_upstream(8443).unwrap(), (None, 8443));
+        // Port-only: dynamic host, explicit port.
+        assert_eq!(
+            route(Some("9001")).resolved_upstream(443).unwrap(),
+            (None, 9001)
+        );
+        // Bare host: fixed host, listener port.
+        assert_eq!(
+            route(Some("cdn.x")).resolved_upstream(443).unwrap(),
+            (Some("cdn.x".into()), 443)
+        );
+        // host:port: both fixed.
+        assert_eq!(
+            route(Some("cdn.x:8080")).resolved_upstream(443).unwrap(),
+            (Some("cdn.x".into()), 8080)
+        );
+        // An explicitly empty string is a config error, not a silent default.
+        assert!(route(Some("  ")).resolved_upstream(443).is_err());
     }
 
     #[test]

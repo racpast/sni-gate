@@ -1,0 +1,29 @@
+# Build output
+/target
+
+# Local runtime state — never commit private keys or issued material
+/ca/
+/certs/
+*.key
+*.pem
+*.pdb
+
+# Downloaded PSL cache (network mode); canonical copy is assets/
+/public_suffix_list.dat
+/psl-cache.dat
+
+# Local runtime config (copy from sni-gate.example.toml)
+/sni-gate.toml
+
+# Local cargo proxy config (machine-specific)
+/.cargo/
+
+# Logs
+*.log
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

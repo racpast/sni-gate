@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Format + lint once (platform-independent) so every push fails fast on style.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nasm cmake clang
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lint-${{ hashFiles('**/Cargo.lock') }}
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+  # Full build + full test suite on every major platform, on every push.
+  #
+  # Runners are pinned to "latest" aliases so we always get the freshest,
+  # best-provisioned image (older images — e.g. macos-13 — sit in smaller pools
+  # and can queue for many minutes). Apple Silicon (macos-latest) covers macOS;
+  # x86_64 macOS is not tested per-push (it is cross-built at release time) to
+  # keep push feedback fast. `ubuntu-24.04-arm` is the current standard label
+  # for arm64 Linux — there is no `ubuntu-latest-arm` alias yet.
+  #
+  # `timeout-minutes` bounds any single job so a stuck/slow runner fails fast
+  # instead of hanging the whole run; `continue-on-error` on macOS keeps a
+  # capacity blip on that pool from blocking the overall verdict, while Linux
+  # and Windows remain required.
+  test:
+    name: Build & test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.timeout }}
+    continue-on-error: ${{ matrix.soft }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest      # Linux x86_64
+            timeout: 20
+            soft: false
+          - os: ubuntu-24.04-arm   # Linux aarch64
+            timeout: 20
+            soft: false
+          - os: windows-latest     # Windows x86_64
+            timeout: 30
+            soft: false
+          - os: macos-latest       # macOS aarch64 (Apple Silicon)
+            timeout: 30
+            soft: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # aws-lc-rs builds C: cmake everywhere, plus NASM on x86_64.
+      - name: Install build deps (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nasm cmake clang
+
+      - name: Install build deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install nasm cmake
+
+      - name: Install NASM (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1.5.2
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.os }}-cargo-
+
+      - name: Build
+        run: cargo build --locked
+
+      # Full suite: unit tests + integration tests (tests/e2e.rs launches the
+      # binary against a mock backend and exercises TLS termination, dynamic
+      # cert issuance, raw passthrough, and the half-close/WebSocket path).
+      - name: Test
+        run: cargo test --locked

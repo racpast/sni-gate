@@ -1,0 +1,68 @@
+[package]
+name = "sni-gate"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Multi-listener SNI/Host-routing TLS gateway: dynamic per-SNI certificate issuance on termination, with ECH / TLS / HTTP / raw upstreams"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["tls", "sni", "ech", "reverse-proxy", "certificate"]
+categories = ["network-programming"]
+
+[[bin]]
+name = "sni-gate"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "time", "sync"] }
+
+# TLS with native ECH client support. aws-lc-rs provides the HPKE suites ECH
+# needs; the whole binary standardizes on this one provider.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12", "logging"] }
+rustls-pemfile = "2"
+webpki-roots = "1"
+
+# DNS: DoH / DoT / plain, for ECH HTTPS-record lookups and upstream A/AAAA.
+hickory-resolver = { version = "0.26", default-features = false, features = ["tokio", "https-aws-lc-rs", "tls-aws-lc-rs", "webpki-roots"] }
+
+# Local CA + dynamic leaf issuance.
+rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
+x509-parser = "0.18"
+
+# Routing (precompiled regex), wildcard base derivation (public suffix list).
+regex = "1"
+publicsuffix = "2"
+
+# In-memory caches (issued certs, per-inner ECH configs).
+moka = { version = "0.12", features = ["sync"] }
+
+# PSL network refresh (optional, proxy-aware) + cron scheduling.
+ureq = "3"
+cron = "0.17"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# Config, logging, misc.
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+humantime-serde = "1"
+base64 = "0.22"
+url = "2"
+sha1 = "0.11"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+time = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[dev-dependencies]
+rustls-pemfile = "2"
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12"] }

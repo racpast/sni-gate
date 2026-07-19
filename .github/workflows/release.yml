@@ -1,0 +1,272 @@
+name: Release
+
+# Manual release: build + test, auto-increment the version, generate a
+# changelog from Conventional Commits, tag, cross-build privacy-hardened
+# binaries for the major platforms, and publish a GitHub Release.
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Semver part to increment"
+        required: true
+        default: patch
+        type: choice
+        options: [patch, minor, major]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Compute the next version, generate the changelog, commit the bump, tag.
+  # ---------------------------------------------------------------------------
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
+      version: ${{ steps.ver.outputs.next }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Compute next version
+        id: ver
+        run: |
+          set -euo pipefail
+          last="$(git tag --list 'v*' --sort=-v:refname | head -n1)"
+          [ -n "$last" ] || last="v0.0.0"
+          IFS=. read -r major minor patch <<EOF
+          ${last#v}
+          EOF
+          case "${{ inputs.bump }}" in
+            major) major=$((major+1)); minor=0; patch=0 ;;
+            minor) minor=$((minor+1)); patch=0 ;;
+            patch) patch=$((patch+1)) ;;
+          esac
+          next="${major}.${minor}.${patch}"
+          echo "last=$last"  >> "$GITHUB_OUTPUT"
+          echo "next=$next"  >> "$GITHUB_OUTPUT"
+          echo "tag=v$next"  >> "$GITHUB_OUTPUT"
+
+      - name: Generate changelog
+        run: |
+          set -euo pipefail
+          last="${{ steps.ver.outputs.last }}"
+          range="HEAD"
+          if git rev-parse "$last" >/dev/null 2>&1 && [ "$last" != "v0.0.0" ]; then
+            range="${last}..HEAD"
+          fi
+          {
+            echo "## ${{ steps.ver.outputs.tag }}"
+            echo
+            for pair in "feat:Features" "fix:Bug Fixes" "perf:Performance" \
+                        "refactor:Refactoring" "docs:Documentation" "test:Tests" \
+                        "build:Build" "ci:CI" "chore:Chores"; do
+              type="${pair%%:*}"; title="${pair##*:}"
+              body="$(git log "$range" --no-merges --pretty=format:'%s' \
+                      | grep -E "^${type}(\(.+\))?!?: " || true)"
+              if [ -n "$body" ]; then
+                echo "### $title"
+                echo "$body" | sed -E "s/^${type}(\(([^)]+)\))?!?: /- (\2) /; s/- \(\) /- /"
+                echo
+              fi
+            done
+            other="$(git log "$range" --no-merges --pretty=format:'%s' \
+                     | grep -Ev '^(feat|fix|perf|refactor|docs|test|build|ci|chore)(\(.+\))?!?: ' || true)"
+            if [ -n "$other" ]; then
+              echo "### Other"; echo "$other" | sed 's/^/- /'; echo
+            fi
+          } > CHANGELOG_RELEASE.md
+          cat CHANGELOG_RELEASE.md
+
+      - name: Bump Cargo.toml version, commit & tag
+        run: |
+          set -euo pipefail
+          next="${{ steps.ver.outputs.next }}"
+          sed -i -E "0,/^version = \".*\"/s//version = \"$next\"/" Cargo.toml
+          cargo update -p sni-gate --precise "$next" 2>/dev/null || true
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore(release): ${{ steps.ver.outputs.tag }}"
+          git tag -a "${{ steps.ver.outputs.tag }}" -m "${{ steps.ver.outputs.tag }}"
+          git push origin HEAD --follow-tags
+
+      - name: Upload changelog artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: changelog
+          path: CHANGELOG_RELEASE.md
+
+  # ---------------------------------------------------------------------------
+  # 2. Cross-build privacy-hardened binaries for the major platforms.
+  # ---------------------------------------------------------------------------
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both a dynamic build (smaller; links the platform libc/CRT) and a
+        # fully static build (no runtime dependencies) are shipped where the
+        # platform supports it. macOS cannot link libSystem statically, so it
+        # ships a single (dynamic) artifact — normal for that platform.
+        include:
+          # --- Linux x86_64 ---
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: sni-gate-x86_64-linux
+            static: false
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset: sni-gate-x86_64-linux-static
+            static: true
+          # --- Linux aarch64 ---
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: sni-gate-aarch64-linux
+            static: false
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            asset: sni-gate-aarch64-linux-static
+            static: true
+          # --- Windows x86_64 ---
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: sni-gate-x86_64-windows.exe
+            static: false
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: sni-gate-x86_64-windows-static.exe
+            static: true
+          # --- macOS (dynamic only; both archs cross-built on Apple Silicon
+          #     to avoid the slow/queued older Intel runner pool) ---
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: sni-gate-aarch64-macos
+            static: false
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset: sni-gate-x86_64-macos
+            static: false
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.tag }} # build the freshly tagged commit
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # aws-lc-rs builds C: needs cmake everywhere, NASM on Windows/x86, and
+      # musl-tools for the static Linux targets.
+      - name: Install build deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nasm cmake clang
+          if [ "${{ matrix.static }}" = "true" ]; then
+            sudo apt-get install -y --no-install-recommends musl-tools musl-dev
+          fi
+
+      - name: Install build deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install nasm cmake
+
+      - name: Install NASM (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1.5.2
+
+      # Full test suite on this platform before we publish its binary. Skipped
+      # only where the target cannot run natively on the runner:
+      #   * musl static Linux (tested via its glibc sibling — same source), and
+      #   * the x86_64 macOS cross-build on the Apple Silicon runner
+      #     (tested via the native aarch64 macOS sibling).
+      # Native Linux/Windows/arm-macOS targets always run the full suite.
+      - name: Test
+        if: >-
+          (matrix.static != true || runner.os == 'Windows')
+          && matrix.target != 'x86_64-apple-darwin'
+        run: cargo test --locked --target ${{ matrix.target }}
+
+      - name: Build (privacy-hardened, path-remapped)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          workspace="$(pwd)"
+          # Strip symbols and remap Rust source paths (no build-machine paths).
+          rustflags="--remap-path-prefix=${cargo_home}=cargo --remap-path-prefix=${workspace}=. -Cstrip=symbols"
+          # Windows static build: link the CRT statically (like C's /MT).
+          if [ "${{ matrix.static }}" = "true" ] && [ "${{ runner.os }}" = "Windows" ]; then
+            rustflags="$rustflags -Ctarget-feature=+crt-static"
+          fi
+          export RUSTFLAGS="$rustflags"
+          # Remap C __FILE__ paths (aws-lc-sys) where the C compiler supports it.
+          # MSVC's cl has no such flag, so on Windows we build the C with clang.
+          if [ "${{ runner.os }}" != "Windows" ]; then
+            remap="-ffile-prefix-map=${cargo_home}=cargo -ffile-prefix-map=${workspace}=."
+            export CFLAGS="${CFLAGS:-} $remap"
+            export CXXFLAGS="${CXXFLAGS:-} $remap"
+          fi
+          # aws-lc-rs on musl needs the musl C compiler for its C sources.
+          if [ "${{ matrix.static }}" = "true" ] && [ "${{ runner.os }}" = "Linux" ]; then
+            export CC_x86_64_unknown_linux_musl=musl-gcc
+            export CC_aarch64_unknown_linux_musl=musl-gcc
+          fi
+          cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          bin="target/${{ matrix.target }}/release/sni-gate"
+          [ -f "$bin" ] || bin="${bin}.exe"
+          cp "$bin" "dist/${{ matrix.asset }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+
+  # ---------------------------------------------------------------------------
+  # 3. Collect every platform binary and publish the release.
+  # ---------------------------------------------------------------------------
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Assemble release assets
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -type f -name 'sni-gate-*' -exec cp {} dist/ \;
+          cp sni-gate.example.toml dist/
+          (cd dist && sha256sum sni-gate-* > SHA256SUMS)
+          ls -l dist
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.tag }}
+          body_path: artifacts/changelog/CHANGELOG_RELEASE.md
+          files: |
+            dist/sni-gate-*
+            dist/sni-gate.example.toml
+            dist/SHA256SUMS

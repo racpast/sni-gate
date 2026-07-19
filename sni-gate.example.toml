@@ -1,0 +1,131 @@
+# sni-gate configuration.
+#
+# Copy to `sni-gate.toml` and edit. Run:  sni-gate.exe            (loads ./sni-gate.toml)
+#                                    or:  sni-gate.exe -c <path>
+#
+# Model: [global] defaults → [[listener]] (one per inbound port) → each
+# listener's [[listener.route]] rules + optional [listener.default_route].
+# Overridable settings inherit outward: route.ech → route → listener → global.
+
+# ---------------------------------------------------------------------------
+# Global defaults (outermost fallback scope)
+# ---------------------------------------------------------------------------
+[global]
+log = "info"                                   # or SNI_GATE_LOG / RUST_LOG
+
+# Generic DNS resolver used for both ECH HTTPS-record lookups and upstream
+# A/AAAA, unless overridden. Forms:
+#   "system"                          the OS resolver
+#   "https://host[:port]/dns-query"   DoH
+#   "tls://host[:port]"               DoT
+#   "udp://ip[:port]" | "ip[:port]"   plain DNS to an IP
+resolver = "https://1.1.1.1/dns-query"
+# ech_resolver / addr_resolver may override the generic resolver per purpose.
+ech_refresh = "1h"                             # ECH config refresh bound
+# nat64_prefix = "64:ff9b::"                   # /96 prefix, hierarchical
+# address_family = "dual"                      # dual (default) | ipv4 | ipv6
+# Fail/unmatched policy. Field-less modes take a bare string; passthrough needs
+# a table:  unmatched = "close"  |  "system-outbound"  |
+#           { mode = "passthrough", addr = "127.0.0.1:80" }
+unmatched = "close"
+
+# ---------------------------------------------------------------------------
+# Certificate authority (dynamic per-SNI issuance on TLS termination)
+# ---------------------------------------------------------------------------
+[ca]
+cert_path = "ca/ca.crt"       # generated on first run if missing
+key_path  = "ca/ca.key"
+common_name = "SNI Gate Local CA"
+organization = ""             # optional O on the CA and issued leaves
+country = ""                  # optional C
+leaf_validity_days = 397
+install_to_system_root = false  # opt-in; Administrator on Windows; idempotent
+
+[issuance]
+wildcard = true               # issue {base, *.base} anchored at the registrable domain
+
+[store]
+enabled = true                # persist issued certs across restarts
+dir = "certs"
+renew_margin_days = 30
+
+[cache]
+capacity = 8192
+ttl_secs = 86400
+
+[cache.psl]                   # public-suffix list (wildcard base derivation)
+source = "embedded"           # embedded | file | network
+# path = "public_suffix_list.dat"
+# url = "https://publicsuffix.org/list/public_suffix_list.dat"
+# cron = "0 17 3 * * 0"       # weekly refresh (network mode)
+# timeout_secs = 30
+# proxy = ""                  # optional; empty = direct
+
+# ===========================================================================
+# Listener 1 — HTTPS on 443
+# ===========================================================================
+[[listener]]
+addr = "0.0.0.0:443"
+connect_timeout = "5s"
+
+  # ECH re-origination: hide the true SNI from the path to the CDN edge.
+  [[listener.route]]
+  name = "wnacg"
+  type = "ech"
+  match_sni = [".wnacg.com"]         # exact | *.x | .x (suffix) | ~regex
+  upstream = "cdn.rpnet.cc:443"
+  # override_sni = "real.inner.site" # inner (protected) SNI; unset = inbound SNI
+  # nat64_prefix / addr_resolver / ech_resolver may be set here, per route.
+
+    [listener.route.ech]
+    mode = "static"                  # static | doh | doh-with-fallback
+    config = "AEX+DQBBsQAgACBb5UPmgfmO14XgxYAbwMJAXBjSXYN/RxMaV8zIMT4dGAAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA="
+    require_ech = true
+    max_retries = 2
+
+  [[listener.route]]
+  name = "wnacg-doh"
+  type = "ech"
+  match_sni = [".example.com"]
+  upstream = "127.0.0.1:80"
+
+    [listener.route.ech]
+    mode = "doh"
+    ech_domain = "cloudflare-ech.com"  # name whose HTTPS record carries ech=
+    ech_refresh = "20min"
+    require_ech = true
+
+  # Plain TLS upstream with an overridden SNI.
+  [[listener.route]]
+  name = "direct"
+  type = "tls"
+  match_sni = ["*.direct.com"]
+  upstream = "127.0.0.1:8866"
+  override_sni = "backend.internal"
+
+  # Cleartext HTTP upstream.
+  [[listener.route]]
+  name = "plain"
+  type = "http"
+  match_sni = ["plain.local"]
+  upstream = "127.0.0.1:8080"
+
+  # Catch-all for SNI/Host matching no route above.
+  [listener.default_route]
+  type = "tls"
+  upstream = "127.0.0.1:443"
+  require_ech = false
+  fail = { mode = "close" }
+
+# ===========================================================================
+# Listener 2 — 8443, raw passthrough (no termination, no cert issued)
+# ===========================================================================
+[[listener]]
+addr = "0.0.0.0:8443"
+connect_timeout = "5s"
+
+  [[listener.route]]
+  name = "raw-a"
+  type = "raw"
+  match_sni = [".a.com"]
+  upstream = "127.0.0.1:5553"

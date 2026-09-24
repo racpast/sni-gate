@@ -1,288 +1,151 @@
-//! Statistical models for per-candidate ranking.
-//!
-//! Three independent components, each with a single responsibility:
-//!
-//! * [`KalmanRtt`] — scalar Kalman filter for RTT, with integrated one-sided
-//!   CUSUM change detector. The filter tracks the posterior mean *and*
-//!   variance; the variance is the uncertainty signal the rest of the system
-//!   uses. CUSUM detects step increases (gradual CDN degradation) that a
-//!   simple failure threshold misses, and widens the variance so the filter
-//!   re-converges quickly on the new regime.
-//!
-//! * [`NigThroughput`] — Normal-Inverse-Gamma conjugate posterior over
-//!   log-throughput. Updates are O(1) and exact. Time discounting is applied
-//!   on each new observation rather than on a wall-clock schedule, so a
-//!   candidate with no traffic retains its estimate indefinitely until new
-//!   evidence arrives. Subnet-level priors (see [`SubnetKey`]) propagate
-//!   information across candidates that share an IP prefix, which is the
-//!   primary mechanism for making Thompson Sampling viable at N > 1000.
-//!
-//! * [`score`] — the unified ranking key, in seconds:
-//!   `rtt_estimate + payload_bytes / throughput_sample`.
-//!   When `payload_bytes` is zero the throughput layer is entirely inert —
-//!   the score is the Kalman RTT estimate, exactly matching the pre-existing
-//!   EWMA behaviour. Thompson Sampling only fires when `payload_bytes > 0`,
-//!   so operators who do not configure a payload size get no change in
-//!   routing behaviour.
-//!
-//! All types are plain structs with no interior mutability. They live inside
-//! the probe task's exclusive `PoolState` and are never shared across tasks.
+//! Statistical state for endpoint selection. Active probes estimate RTT;
+//! completed transfers update a discounted NIG posterior over log rate.
+//! Selection samples the posterior of the latent mean, not the predictive
+//! distribution of another noisy observation. Discounting deliberately keeps
+//! uncertainty under changing conditions; no stationary regret bound is assumed.
 
+use rand::Rng;
+use rand_distr::{Distribution, StudentT};
 use std::net::IpAddr;
 use std::time::Duration;
 
-// ---------------------------------------------------------------------------
-// Kalman RTT filter + one-sided CUSUM change detector
-// ---------------------------------------------------------------------------
-
-/// Initial (wide) posterior variance assigned to every new or reset candidate.
-/// Large enough to make the filter high-gain until it converges.
-const WIDE_P: f64 = 1_000.0; // ms²
-
-/// Posterior variance below which the filter is considered converged and
-/// CUSUM activation is permitted.
-const CUSUM_ACTIVATE_P: f64 = 5.0; // ms²
-
-/// The RTT shift (ms) that CUSUM is tuned to detect. Half this value is
-/// subtracted each step as the allowance; false alarms are unlikely below it.
+const WIDE_P: f64 = 1_000.0;
 const CUSUM_DELTA_MS: f64 = 50.0;
-
-/// CUSUM alarm threshold. Expressed in ms so the alarm fires after cumulative
-/// evidence of a ~CUSUM_DELTA_MS shift accumulates past this level.
 const CUSUM_H: f64 = 200.0;
 
-/// Scalar Kalman filter for RTT, with integrated one-sided CUSUM.
-///
-/// The process model is a random walk: `x_k = x_{k-1} + w_k`, where `w_k`
-/// has variance Q. This is appropriate for CDN nodes whose RTT is piecewise-
-/// stable with occasional step changes (route updates, PoP failovers). The
-/// CUSUM component detects those step changes so the filter can re-converge
-/// on the new baseline quickly, without forcing Q to be large enough to
-/// track rapid changes at the cost of steady-state noise.
+/// A successful probe establishes availability regardless of measurement noise.
+/// Posterior uncertainty controls smoothing, never whether an endpoint is usable.
 #[derive(Debug, Clone)]
 pub struct KalmanRtt {
-    /// Posterior mean, in milliseconds.
     pub mean_ms: f64,
-    /// Posterior variance (uncertainty), in ms².
-    /// Starts wide, shrinks as observations accumulate, resets on a CUSUM
-    /// alarm so the filter behaves like a high-gain filter until it re-settles.
     pub variance: f64,
-    /// Process noise Q: how much the true RTT can drift between observations.
     q: f64,
-    /// Observation noise R: expected measurement variance of one RTT sample.
     r: f64,
-    /// One-sided CUSUM accumulator for detecting upward RTT shifts.
     cusum: f64,
-    /// Whether the filter has converged at least once; CUSUM only fires
-    /// after the first convergence to avoid false alarms during startup.
-    converged: bool,
+    initialized: bool,
 }
 
 impl KalmanRtt {
     pub fn new(q: f64, r: f64) -> Self {
         Self {
-            mean_ms: 200.0, // conservative prior: 200 ms before any data
+            mean_ms: 0.0,
             variance: WIDE_P,
             q,
             r,
             cusum: 0.0,
-            converged: false,
+            initialized: false,
         }
     }
 
-    /// Incorporate one RTT measurement.
-    ///
-    /// Returns `true` when CUSUM fired, indicating a detected upward regime
-    /// change. The internal state has already been reset to a wide posterior
-    /// so the next call enters a fast-convergence phase. The caller should log
-    /// a warning; no other action is required.
     pub fn update(&mut self, obs: Duration) -> bool {
         let obs_ms = obs.as_secs_f64() * 1000.0;
-
-        // Predict: advance the state covariance by the process noise.
-        let p_pred = self.variance + self.q;
-
-        // Update: apply the Kalman gain.
-        let k = p_pred / (p_pred + self.r);
-        let innovation = obs_ms - self.mean_ms;
-        self.mean_ms += k * innovation;
-        self.variance = (1.0 - k) * p_pred;
-
-        if self.variance < CUSUM_ACTIVATE_P {
-            self.converged = true;
-        }
-
-        // CUSUM is only meaningful once the filter has settled on a baseline.
-        if !self.converged {
+        if !self.initialized {
+            self.mean_ms = obs_ms;
+            self.variance = self.r;
+            self.initialized = true;
             return false;
         }
-
-        // Page's one-sided CUSUM for an upward shift of CUSUM_DELTA_MS.
-        // The slack CUSUM_DELTA_MS/2 means the statistic drifts down when the
-        // RTT is below mean + CUSUM_DELTA_MS/2 and drifts up above it.
+        let innovation = obs_ms - self.mean_ms;
         self.cusum = (self.cusum + innovation - CUSUM_DELTA_MS / 2.0).max(0.0);
-        if self.cusum > CUSUM_H {
-            // Reset: widen P so the filter re-acquires the new level quickly,
-            // and clear the accumulator so CUSUM does not fire again immediately.
-            self.variance = WIDE_P;
+        let alarm = self.cusum > CUSUM_H;
+        if alarm {
             self.cusum = 0.0;
-            return true;
+            self.variance = self.variance.max(WIDE_P);
         }
-        false
+        // Stable gain and covariance even for finite Q/R near f64::MAX.
+        let predicted = (self.variance + self.q).min(f64::MAX);
+        let gain = if predicted > self.r {
+            1.0 / (1.0 + self.r / predicted)
+        } else {
+            let ratio = predicted / self.r;
+            ratio / (1.0 + ratio)
+        };
+        self.mean_ms += gain * innovation;
+        self.variance = self.r * gain;
+        alarm
     }
 
-    /// Best estimate of the current RTT, in Duration form.
-    #[inline]
     pub fn estimate(&self) -> Duration {
-        Duration::from_secs_f64(self.mean_ms / 1000.0)
+        // Observations are Durations. Clamp rounding at the largest representable
+        // duration, rather than letting conversion at that endpoint panic.
+        let seconds = self.mean_ms / 1000.0;
+        Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX)
     }
 
-    /// Whether the filter has converged (variance dropped below the activation threshold).
-    #[inline]
-    pub fn is_converged(&self) -> bool {
-        self.converged
+    pub fn is_initialized(&self) -> bool {
+        self.initialized
     }
 }
 
-// ---------------------------------------------------------------------------
-// Normal-Inverse-Gamma posterior over log-throughput
-// ---------------------------------------------------------------------------
+// Encompass representable transfer byte/time ratios while keeping sampled
+// scores finite even for u64::MAX payloads and extreme posterior tail draws.
+pub const MIN_THROUGHPUT_BPS: f64 = 1e-20;
+const MAX_THROUGHPUT_BPS: f64 = 1e30;
 
-/// Throughput lower bound used to guard against log(0) and score overflow.
-/// 1 KB/s is below any real connection that would be used for web traffic.
-pub const MIN_THROUGHPUT_BPS: f64 = 1_024.0;
-
-/// Default prior parameters: a weak belief centred at 256 KB/s with high
-/// uncertainty. This is conservative: most CDN nodes can do far better, so
-/// the posterior moves toward the true value quickly.
 pub fn default_nig_prior() -> NigThroughput {
-    NigThroughput::new(
-        (256.0 * 1_024.0_f64).ln(), // μ₀ ≈ ln(262 144) ≈ 12.5 nats
-        0.5,                        // κ₀: half a pseudo-observation
-        1.5,                        // α₀
-        1.0,                        // β₀
-    )
+    NigThroughput::new((256.0 * 1024.0_f64).ln(), 0.5, 1.5, 1.0)
 }
 
-/// Normal-Inverse-Gamma conjugate posterior over log-throughput.
-///
-/// The model: `log(throughput) ~ N(μ, σ²)` with a NIG prior on `(μ, σ²)`.
-/// Updates are O(1) and exact — no Monte Carlo sampling is required for the
-/// posterior parameters themselves. Thompson Sampling draws one value from
-/// the posterior predictive, which is a Student-t in log space; we use the
-/// normal approximation to that t, which is accurate for α > 2 and
-/// acceptably optimistic in the tails for sparse data.
-///
-/// Time discounting: the pseudo-count κ and shape α are scaled by `γ < 1`
-/// *before* each new observation is folded in. This gives recent observations
-/// more weight than old ones without requiring a separate scheduled sweep.
-/// A candidate with zero traffic retains its estimate indefinitely, which is
-/// correct: absence of new data is not evidence of change.
+/// NIG posterior over log transfer rate. The marginal posterior of its mean
+/// is Student-t(2 alpha, mu, sqrt(beta / (alpha kappa))). Sampling that mean
+/// expresses uncertainty about the endpoint, excluding irreducible sample noise.
 #[derive(Debug, Clone)]
 pub struct NigThroughput {
-    /// Posterior mean of log-throughput (nats).
     pub mu: f64,
-    /// Pseudo-observation count; measures confidence in μ.
     pub kappa: f64,
-    /// Shape of the inverse-gamma marginal on variance.
     pub alpha: f64,
-    /// Scale of the inverse-gamma marginal on variance.
     pub beta: f64,
-    // Prior floor — discount never goes below the original prior strength.
-    #[allow(dead_code)]
-    mu0: f64,
     kappa0: f64,
     alpha0: f64,
     beta0: f64,
 }
 
 impl NigThroughput {
-    pub fn new(mu: f64, kappa: f64, alpha: f64, beta: f64) -> Self {
+    fn new(mu: f64, kappa: f64, alpha: f64, beta: f64) -> Self {
         Self {
             mu,
             kappa,
             alpha,
             beta,
-            mu0: mu,
             kappa0: kappa,
             alpha0: alpha,
             beta0: beta,
         }
     }
 
-    /// Update the posterior with one throughput measurement (bytes/sec).
-    ///
-    /// `gamma` is the time-discount factor applied before the update. Values
-    /// near 1.0 retain old information longer; 0.9 causes roughly half the
-    /// effective sample count to decay within ~7 observations.
     pub fn observe(&mut self, bps: f64, gamma: f64) {
-        let x = bps.max(MIN_THROUGHPUT_BPS).ln();
-        self.decay(gamma);
-
-        // Conjugate NIG update for one observation x:
-        //   κ_n = κ + 1
-        //   μ_n = (κ μ + x) / κ_n
-        //   α_n = α + ½
-        //   β_n = β + κ(x − μ)² / (2 κ_n)
-        let kn = self.kappa + 1.0;
-        let diff = x - self.mu;
-        self.mu = (self.kappa * self.mu + x) / kn;
-        self.alpha += 0.5;
-        self.beta += self.kappa * diff * diff / (2.0 * kn);
-        self.kappa = kn;
-    }
-
-    /// Apply time decay without a new observation. Used for subnet priors
-    /// when they are updated on behalf of a member candidate.
-    pub fn decay(&mut self, gamma: f64) {
+        if !bps.is_finite() || bps <= 0.0 {
+            return;
+        }
+        let x = bps.clamp(MIN_THROUGHPUT_BPS, MAX_THROUGHPUT_BPS).ln();
         self.kappa = (self.kappa * gamma).max(self.kappa0);
         self.alpha = (self.alpha * gamma).max(self.alpha0);
         self.beta = (self.beta * gamma).max(self.beta0);
-        // mu is a weighted mean; scaling kappa symmetrically keeps it stable.
+        let kn = self.kappa + 1.0;
+        let diff = x - self.mu;
+        self.mu += diff / kn;
+        self.alpha += 0.5;
+        self.beta += (self.kappa / kn) * diff * diff / 2.0;
+        self.kappa = kn;
     }
 
-    /// Draw one throughput sample (bytes/sec) for Thompson Sampling.
-    ///
-    /// The posterior predictive is Student-t in log space; we use the normal
-    /// approximation `N(μ, β(κ+1)/(α·κ))`. The result is exponentiated and
-    /// clamped to at least [`MIN_THROUGHPUT_BPS`].
-    pub fn sample(&self) -> f64 {
-        // Marginal variance of μ under the NIG: β(κ+1)/(α·κ).
-        let scale_sq = (self.beta * (self.kappa + 1.0)) / (self.alpha * self.kappa);
-        let scale = scale_sq.sqrt().max(1e-6);
-        let log_bps = self.mu + scale * standard_normal();
-        log_bps.exp().max(MIN_THROUGHPUT_BPS)
+    /// Exact Student-t marginal sampling using the Rand distribution library.
+    /// All alpha values are at least the prior's 1.5.
+    pub fn sample(&self, rng: &mut impl Rng) -> f64 {
+        let distribution = StudentT::new(2.0 * self.alpha).expect("NIG shape remains positive");
+        let scale = ((self.beta / self.alpha) / self.kappa).sqrt();
+        let log_bps = self.mu + scale * distribution.sample(rng);
+        log_bps
+            .clamp(MIN_THROUGHPUT_BPS.ln(), MAX_THROUGHPUT_BPS.ln())
+            .exp()
     }
 
-    /// Posterior mean throughput (bytes/sec), for diagnostics and logging.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn mean_bps(&self) -> f64 {
-        // E[log-normal] with μ and σ² = β/(α−1) (when α > 1).
-        if self.alpha > 1.0 {
-            (self.mu + self.beta / (2.0 * (self.alpha - 1.0))).exp()
-        } else {
-            self.mu.exp()
-        }
+    /// Geometric centre, for deterministic diagnostics rather than selection.
+    pub fn typical_bps(&self) -> f64 {
+        self.mu.exp()
     }
 }
 
-// ---------------------------------------------------------------------------
-// Subnet grouping for hierarchical priors
-// ---------------------------------------------------------------------------
-
-/// The subnet key used to group candidates into a shared prior.
-///
-/// IPv4 candidates are grouped into /24 subnets (first three octets);
-/// IPv6 into /48 subnets (first six bytes). This reflects CDN anycast
-/// topology: within a /24 or /48 the addresses typically share the same
-/// PoP and have correlated throughput. Sharing a prior means one
-/// observation propagates useful information to all sibling candidates,
-/// which is what keeps Thompson Sampling viable at N > 1000 even when
-/// only a few candidates have received direct observations.
-///
-/// Candidates from different ASes or PoPs that happen to share a prefix
-/// are not harmed: the prior is weak (κ₀ = 0.5), so a few individual
-/// observations override it quickly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SubnetKey {
     V4([u8; 3]),
@@ -304,51 +167,78 @@ impl SubnetKey {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Score formula
-// ---------------------------------------------------------------------------
-
-/// Compute the ranking score for a candidate (in seconds, lower is better).
-///
-/// When `payload_bytes` is zero the score is the Kalman RTT estimate — no
-/// throughput sampling occurs and routing behaviour is unchanged relative
-/// to the EWMA-based design. When `payload_bytes > 0` a single sample is
-/// drawn from the NIG posterior and used to estimate transfer time; the
-/// total score is `rtt + payload / sampled_throughput`.
-///
-/// Candidates with little throughput data have wide NIG posteriors and
-/// will occasionally draw optimistic samples, routing a connection their
-/// way and collecting a passive observation. Candidates with tight posteriors
-/// draw near their mean, providing stability.
-pub fn score(kalman: &KalmanRtt, nig: &NigThroughput, payload_bytes: u64) -> f64 {
-    let rtt_s = kalman.mean_ms / 1000.0;
+/// Score one candidate using exactly one posterior draw for this decision.
+pub fn score(rtt: Duration, nig: &NigThroughput, payload_bytes: u64, rng: &mut impl Rng) -> f64 {
+    let rtt_s = rtt.as_secs_f64();
     if payload_bytes == 0 {
         return rtt_s;
     }
-    let tp = nig.sample().max(MIN_THROUGHPUT_BPS);
-    rtt_s + payload_bytes as f64 / tp
+    rtt_s + payload_bytes as f64 / nig.sample(rng)
 }
-
-// ---------------------------------------------------------------------------
-// PRNG utility
-// ---------------------------------------------------------------------------
-
-/// One standard-normal variate via the Box-Muller transform.
-/// Uses `rand::random::<f64>()` which is already a project dependency.
-fn standard_normal() -> f64 {
-    use std::f64::consts::TAU;
-    let u1 = (rand::random::<f64>()).max(f64::EPSILON);
-    let u2 = rand::random::<f64>();
-    (-2.0 * u1.ln()).sqrt() * (TAU * u2).cos()
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn healthy_measurements_are_usable_across_valid_noise_scales() {
+        for (q, r) in [
+            (0.0, 0.1),
+            (10.0, 10.0),
+            (1e308, 1e308),
+            (0.0, f64::MIN_POSITIVE),
+        ] {
+            let mut filter = KalmanRtt::new(q, r);
+            assert!(!filter.is_initialized());
+            for i in 0..100 {
+                let measurement = Duration::from_millis(if i % 2 == 0 { 40 } else { 60 });
+                filter.update(measurement);
+                assert!(filter.is_initialized());
+                assert!(filter.mean_ms.is_finite());
+                assert!(filter.variance.is_finite() && filter.variance >= 0.0);
+                assert!((Duration::from_millis(39)..=Duration::from_millis(61))
+                    .contains(&filter.estimate()));
+            }
+        }
+    }
+
+    #[test]
+    fn first_slow_measurement_is_not_a_false_regime_change() {
+        let mut filter = KalmanRtt::new(0.01, 0.1);
+        assert!(!filter.update(Duration::from_secs(1)));
+        assert_eq!(filter.estimate(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn posterior_mean_uncertainty_shrinks_despite_noisy_observations() {
+        use rand::SeedableRng;
+        let mut posterior = default_nig_prior();
+        for i in 0..100_000 {
+            posterior.observe((14.0_f64 + if i % 2 == 0 { -1.0 } else { 1.0 }).exp(), 1.0);
+        }
+        let mut rng = rand::rngs::StdRng::seed_from_u64(99);
+        let mut squared_error = 0.0;
+        for _ in 0..20_000 {
+            squared_error += (posterior.sample(&mut rng).ln() - posterior.mu).powi(2);
+        }
+        let variance = squared_error / 20_000.0;
+        assert!(
+            (0.000002..0.0001).contains(&variance),
+            "mean posterior variance={variance}"
+        );
+    }
+
+    #[test]
+    fn discount_keeps_model_and_scores_finite_for_extreme_transfer_rates() {
+        use rand::SeedableRng;
+        let mut posterior = default_nig_prior();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(100);
+        for i in 0..1000 {
+            posterior.observe(if i % 2 == 0 { 1e-20 } else { 1e30 }, 0.01);
+            let value = score(Duration::from_secs(1), &posterior, u64::MAX, &mut rng);
+            assert!(value.is_finite() && value >= 1.0);
+        }
+    }
 
     #[test]
     fn kalman_converges_and_tracks() {
@@ -362,7 +252,7 @@ mod tests {
             (45..=55).contains(&est_ms),
             "estimate {est_ms} ms out of range"
         );
-        assert!(k.variance < CUSUM_ACTIVATE_P, "should have converged");
+        assert!(k.is_initialized());
     }
 
     #[test]
@@ -372,7 +262,7 @@ mod tests {
         for _ in 0..30 {
             k.update(Duration::from_millis(50));
         }
-        assert!(k.converged);
+        assert!(k.is_initialized());
         // Now step up to 200 ms; CUSUM should fire within a moderate number
         // of observations (well under 100).
         let mut fired = false;
@@ -384,7 +274,7 @@ mod tests {
         }
         assert!(fired, "CUSUM did not fire on a large step increase");
         // After firing, variance should have been reset.
-        assert!(k.variance >= WIDE_P / 2.0);
+        assert!((k.estimate().as_millis() as i64 - 200).abs() <= 1);
     }
 
     #[test]
@@ -410,7 +300,7 @@ mod tests {
         for _ in 0..50 {
             n.observe(truth, 1.0); // no discount
         }
-        let mean = n.mean_bps();
+        let mean = n.typical_bps();
         // After 50 observations the posterior mean should be within 20% of truth.
         assert!(
             mean > truth * 0.8 && mean < truth * 1.2,
@@ -444,7 +334,7 @@ mod tests {
         let k = KalmanRtt::new(0.01, 0.1);
         let n = default_nig_prior();
         // With payload_bytes = 0, score must equal rtt estimate regardless of nig.
-        let s = score(&k, &n, 0);
+        let s = score(k.estimate(), &n, 0, &mut rand::rng());
         let rtt_s = k.estimate().as_secs_f64();
         assert!(
             (s - rtt_s).abs() < 1e-9,
@@ -470,9 +360,13 @@ mod tests {
         }
         // Payload: 512 KB. fast should almost always score lower.
         let payload = 512 * 1_024;
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(71);
         let mut fast_wins = 0u32;
         for _ in 0..100 {
-            if score(&k_fast, &nig_fast, payload) < score(&k_slow, &nig_slow, payload) {
+            if score(k_fast.estimate(), &nig_fast, payload, &mut rng)
+                < score(k_slow.estimate(), &nig_slow, payload, &mut rng)
+            {
                 fast_wins += 1;
             }
         }

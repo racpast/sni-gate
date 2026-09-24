@@ -34,13 +34,17 @@
 //! # Where the work happens
 //!
 //! One task per pool does all of it: re-resolving domain targets, probing due
-//! candidates, and recomputing the ranking. The data path only reads a snapshot
-//! — see [`Pool::pick`]. Nothing on the data path can trigger a probe, so a burst
+//! candidates, and recomputing the ranking. The data path samples a published
+//! model snapshot and updates its view's atomic incumbent — see [`Pool::pick`].
+//! Nothing on the data path can trigger a probe, so a burst
 //! of traffic cannot turn into a burst of probes.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock, Weak};
+
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -82,6 +86,11 @@ const MAX_CIDR_EXPANSION: usize = 64;
 /// Default upper bound on concurrent probes within one pool, so a large pool cannot open
 /// hundreds of sockets in one cycle. Configurable via `probe.max_concurrent_probes`.
 const DEFAULT_MAX_CONCURRENT_PROBES: usize = 16;
+/// Finite telemetry and per-wakeup work budgets. Traffic never waits for probes.
+const OBSERVATION_CAPACITY: usize = 2048;
+const OBSERVATION_BATCH: usize = 64;
+const MAX_PARKED_CANDIDATES: usize = 4096;
+const MAX_IDLE_SUBNET_PRIORS: usize = 1024;
 
 /// Default Kalman process-noise Q (ms²). Low enough to give a stable steady-state
 /// estimate but high enough to let the filter track gradual CDN RTT drift.
@@ -413,11 +422,9 @@ impl Health {
         }
     }
 
-    /// Current RTT estimate as a `Duration`, available only after the Kalman
-    /// filter has converged (i.e. after at least one successful probe has moved
-    /// variance below `CUSUM_ACTIVATE_P`).
+    /// Current RTT estimate, available after the first successful probe.
     fn rtt(&self) -> Option<Duration> {
-        if self.kalman.is_converged() {
+        if self.kalman.is_initialized() {
             Some(self.kalman.estimate())
         } else {
             None
@@ -489,13 +496,14 @@ struct View {
 /// A finished, ordered answer for one view.
 struct ViewRanking {
     /// Healthy addresses, best first.
-    ordered: Vec<IpAddr>,
+    ordered: Vec<Arc<SelectionModel>>,
+    incumbent: AtomicUsize,
     /// The safety net, used only while `ordered` is empty.
     fallback: Option<IpAddr>,
 }
 
-/// The published snapshot the data path reads. Replaced wholesale by the probe
-/// task; never mutated in place.
+/// Models and ordering are replaced wholesale by the pool worker. Connections
+/// only mutate each view's atomic incumbent within a published snapshot.
 struct Ranking {
     per_view: Vec<ViewRanking>,
 }
@@ -508,11 +516,64 @@ impl Ranking {
             per_view: (0..views)
                 .map(|_| ViewRanking {
                     ordered: Vec::new(),
+                    incumbent: AtomicUsize::new(0),
                     fallback: None,
                 })
                 .collect(),
         }
     }
+}
+
+struct SelectionModel {
+    pub addr: IpAddr,
+    pub rtt: Duration,
+    pub throughput: NigThroughput,
+}
+
+fn choose_candidate(
+    models: &[Arc<SelectionModel>],
+    incumbent: &AtomicUsize,
+    payload: u64,
+) -> Option<IpAddr> {
+    if payload == 0 {
+        return models.first().map(|m| m.addr);
+    }
+    let mut rng = rand::rng();
+    choose_with(models, incumbent, |model| {
+        score(model.rtt, &model.throughput, payload, &mut rng)
+    })
+}
+
+fn choose_with(
+    models: &[Arc<SelectionModel>],
+    incumbent: &AtomicUsize,
+    mut score: impl FnMut(&SelectionModel) -> f64,
+) -> Option<IpAddr> {
+    if models.is_empty() {
+        return None;
+    }
+    let previous = incumbent.load(Ordering::Relaxed).min(models.len() - 1);
+    let mut incumbent_score = 0.0;
+    let mut best = 0;
+    let mut best_score = f64::INFINITY;
+    for (index, model) in models.iter().enumerate() {
+        let value = score(model);
+        if index == previous {
+            incumbent_score = value;
+        }
+        if value < best_score {
+            best = index;
+            best_score = value;
+        }
+    }
+    let (chosen, chosen_score) = if best == previous || beats(best_score, incumbent_score) {
+        (best, best_score)
+    } else {
+        (previous, incumbent_score)
+    };
+    incumbent.store(chosen, Ordering::Relaxed);
+    tracing::debug!(candidate = %models[chosen].addr, score_s = chosen_score, "selected pool candidate");
+    Some(models[chosen].addr)
 }
 
 /// A route's handle on a pool: the pool plus which registered view it reads.
@@ -531,24 +592,36 @@ impl PoolHandle {
 
     /// The address to dial right now, on `port`.
     ///
-    /// Zero I/O, zero allocation, and no evaluation of `select`: one lock-free
-    /// read of a published snapshot and an index into it. The probe task writes;
-    /// this only reads.
+    /// No I/O, allocation, or selector evaluation. Adaptive mode draws one
+    /// score per eligible endpoint from a shared immutable model snapshot.
     pub fn pick(&self, port: u16) -> Result<SocketAddr> {
         self.pool.pick(self.view, port)
     }
 
-    /// Report one passive throughput observation from a completed connection.
-    ///
-    /// Called by `proxy.rs` after `splice` finishes. Non-blocking: the
-    /// observation is queued for the probe task; if the pool has been dropped
-    /// the send is silently discarded.
+    pub fn observes_transfers(&self) -> bool {
+        self.pool.obs_tx.is_some()
+    }
+
+    /// Never block traffic. Overload discards new telemetry with a counted,
+    /// rate-limited diagnostic rather than allocating an unbounded backlog.
     pub fn observe_transfer(&self, addr: IpAddr, bytes: u64, elapsed: Duration) {
-        let _ = self.pool.obs_tx.send(PassiveObs {
-            addr,
-            bytes,
-            elapsed,
-        });
+        if bytes == 0 || elapsed.is_zero() {
+            return;
+        }
+        if let Some(tx) = &self.pool.obs_tx {
+            if matches!(
+                tx.try_send(PassiveObs {
+                    addr,
+                    bytes,
+                    elapsed
+                }),
+                Err(mpsc::error::TrySendError::Full(_))
+            ) {
+                self.pool
+                    .dropped_observations
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 }
 
@@ -582,11 +655,12 @@ pub struct Pool {
     ///
     /// `RwLock<Arc<_>>` and never a lock held across work: a reader clones the
     /// `Arc` out and releases the lock immediately, so publishing a new ranking
-    /// never blocks the data path and a reader in flight keeps using the snapshot
-    /// it started with. Same shape as [`crate::dns_resolvers::DnsResolver`].
+    /// holds the write lock only for the swap. A reader in flight keeps using the
+    /// snapshot it started with. Same shape as [`crate::dns_resolvers::DnsResolver`].
     ranking: RwLock<Arc<Ranking>>,
     /// Sink for passive throughput observations from the proxy.
-    obs_tx: mpsc::UnboundedSender<PassiveObs>,
+    obs_tx: Option<mpsc::Sender<PassiveObs>>,
+    dropped_observations: AtomicU64,
 }
 
 /// NAT64 projection parameters, resolved at build.
@@ -619,8 +693,10 @@ impl Pool {
             .get(view)
             .ok_or_else(|| anyhow!("pool {}: unregistered view {view}", self.name))?;
 
-        if let Some(ip) = vr.ordered.first() {
-            return Ok(SocketAddr::new(*ip, port));
+        if let Some(ip) =
+            choose_candidate(&vr.ordered, &vr.incumbent, self.timing.score_payload_bytes)
+        {
+            return Ok(SocketAddr::new(ip, port));
         }
         if let Some(ip) = vr.fallback {
             return Ok(SocketAddr::new(ip, port));
@@ -670,6 +746,9 @@ impl PoolBuilder {
         probe_ech: Option<ProbeEchSetup>,
         verify: Arc<UpstreamVerify>,
     ) -> Result<Self> {
+        def.probe
+            .validate_parameters()
+            .map_err(|e| anyhow!("[pools.{name}.probe]: {e}"))?;
         let mut targets = Vec::with_capacity(def.targets.len());
         for (index, t) in def.targets.iter().enumerate() {
             let target = TargetSpec::parse(t.addr())
@@ -755,7 +834,8 @@ impl PoolBuilder {
             };
 
         let view_count = self.views.len();
-        let (obs_tx, obs_rx) = mpsc::unbounded_channel::<PassiveObs>();
+        let (obs_tx, obs_rx) = mpsc::channel(OBSERVATION_CAPACITY);
+        let obs_tx = (self.timing.score_payload_bytes != 0).then_some(obs_tx);
         let pool = Arc::new(Pool {
             name: self.name,
             targets: self.targets,
@@ -767,6 +847,7 @@ impl PoolBuilder {
             views: self.views,
             ranking: RwLock::new(Arc::new(Ranking::empty(view_count))),
             obs_tx,
+            dropped_observations: AtomicU64::new(0),
         });
 
         // The task holds only a `Weak`, so it stops on its own if the pool is
@@ -996,9 +1077,11 @@ struct PoolState {
     /// Per-subnet NIG prior, propagated from any candidate that shares the prefix.
     /// New candidates inherit from this prior so Thompson Sampling is effective
     /// even before an individual address has received a direct observation.
-    subnet_priors: HashMap<SubnetKey, NigThroughput>,
+    subnet_priors: HashMap<SubnetKey, SubnetPrior>,
     /// Passive throughput observations queued by the proxy.
-    obs_rx: mpsc::UnboundedReceiver<PassiveObs>,
+    obs_rx: mpsc::Receiver<PassiveObs>,
+    observations_open: bool,
+    last_feedback_warning: Instant,
     /// Best address from the last logged cycle, used to suppress redundant INFO logs.
     last_logged_best: Option<IpAddr>,
     /// Healthy count from the last logged cycle.
@@ -1021,100 +1104,190 @@ struct PoolState {
     resolved_at: Option<Instant>,
 }
 
-async fn run_probe_loop(weak: Weak<Pool>, obs_rx: mpsc::UnboundedReceiver<PassiveObs>) {
+struct SubnetPrior {
+    model: NigThroughput,
+    last_used: Instant,
+}
+
+impl PoolState {
+    pub(super) fn observe(&mut self, obs: PassiveObs, discount: f64, now: Instant) -> bool {
+        if obs.bytes == 0 || obs.elapsed.is_zero() {
+            return false;
+        }
+        let active = self.health.contains_key(&obs.addr);
+        let health = self.health.get_mut(&obs.addr).or_else(|| {
+            self.parked
+                .get_mut(&obs.addr)
+                .filter(|(_, expires)| *expires > now)
+                .map(|(h, _)| h)
+        });
+        let Some(health) = health else {
+            return false;
+        };
+        health.observe_throughput(obs.bytes, obs.elapsed, discount);
+        let bps = obs.bytes as f64 / obs.elapsed.as_secs_f64();
+        let prior = self
+            .subnet_priors
+            .entry(SubnetKey::of(obs.addr))
+            .or_insert_with(|| SubnetPrior {
+                model: default_nig_prior(),
+                last_used: now,
+            });
+        prior.model.observe(bps, discount);
+        prior.last_used = now;
+        debug!(addr = %obs.addr, bytes = obs.bytes, throughput_mbps = bps * 8.0 / 1_000_000.0,
+            "observed passive throughput");
+        active
+    }
+
+    pub(super) fn prune_history(&mut self, now: Instant) {
+        self.parked.retain(|_, (_, expires)| *expires > now);
+        if self.parked.len() > MAX_PARKED_CANDIDATES {
+            let mut oldest: Vec<_> = self
+                .parked
+                .iter()
+                .map(|(addr, (_, expires))| (*addr, *expires))
+                .collect();
+            oldest.sort_unstable_by_key(|(_, expires)| *expires);
+            for (addr, _) in oldest
+                .into_iter()
+                .take(self.parked.len() - MAX_PARKED_CANDIDATES)
+            {
+                self.parked.remove(&addr);
+            }
+        }
+        let retained: HashSet<_> = self
+            .health
+            .keys()
+            .chain(self.parked.keys())
+            .copied()
+            .map(SubnetKey::of)
+            .collect();
+        self.subnet_priors.retain(|key, prior| {
+            retained.contains(key) || now.duration_since(prior.last_used) < PARK_DURATION
+        });
+        let mut idle: Vec<_> = self
+            .subnet_priors
+            .iter()
+            .filter(|(key, _)| !retained.contains(key))
+            .map(|(key, prior)| (*key, prior.last_used))
+            .collect();
+        if idle.len() > MAX_IDLE_SUBNET_PRIORS {
+            idle.sort_unstable_by_key(|(_, last_used)| *last_used);
+            let excess = idle.len() - MAX_IDLE_SUBNET_PRIORS;
+            for (key, _) in idle.into_iter().take(excess) {
+                self.subnet_priors.remove(&key);
+            }
+        }
+    }
+}
+
+async fn run_probe_loop(weak: Weak<Pool>, obs_rx: mpsc::Receiver<PassiveObs>) {
     let mut state = PoolState::new(obs_rx);
-
-    // Small startup jitter so several pools starting together do not fire their
-    // first cycle in the same instant. This delays the first fallback publish by
-    // under half a second, which is immaterial next to a probe cycle.
-    let jitter = Duration::from_millis(rand::random_range(0..400));
-    tokio::time::sleep(jitter).await;
-
+    let mut candidates = Vec::new();
+    tokio::time::sleep(Duration::from_millis(rand::random_range(0..400))).await;
     loop {
         let Some(pool) = weak.upgrade() else {
-            debug!("pool dropped; stopping probe loop");
             return;
         };
-
-        // Drain any passive throughput observations that arrived since the last cycle.
-        drain_observations(&mut state, &pool.timing);
-
-        let candidates = build_candidates(&pool, &mut state).await;
-
-        // Publish *before* probing, so the fallback is usable during the first
-        // cycle rather than only after it.
-        //
-        // This is load-bearing, not an optimization. A cycle takes as long as its
-        // candidates need: a few hundred sampled addresses probed with `mode =
-        // "http"` at the concurrency cap can run for a minute or more. Without
-        // this, `pick` returns an error for that whole window — and on a
-        // `tls`/`ech` route with HTTP/2 enabled the upstream is dialed *before*
-        // the inbound handshake completes, so the failure surfaces to the client
-        // as a broken TLS handshake rather than as an upstream error. A pool that
-        // declares a fallback must honour it from the first connection.
-        //
-        // Nothing is ranked yet at this point, so this publishes fallback only;
-        // on later cycles it republishes the previous order, which is still the
-        // best answer available until this cycle finishes.
+        refresh_domains(&pool, &mut state, &candidates).await;
+        candidates = build_candidates(&pool, &mut state);
+        recompute_order(&mut state, &pool.timing, &candidates);
         publish(&pool, &state, &candidates);
-
         run_cycle(&pool, &mut state, &candidates).await;
         recompute_order(&mut state, &pool.timing, &candidates);
         publish(&pool, &state, &candidates);
         log_cycle(&pool, &mut state, &candidates);
-
-        // Sleep until the next scheduled work. Holding no `Arc` across the sleep
-        // is what lets the pool actually be dropped while idle.
-        let sleep_for = next_due(&pool, &state, &candidates);
+        let deadline = Instant::now() + next_due(&pool, &state, &candidates);
         drop(pool);
-        tokio::time::sleep(sleep_for).await;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break,
+                obs = state.obs_rx.recv(), if state.observations_open => {
+                    let Some(pool) = weak.upgrade() else { return; };
+                    process_observations(&pool, &mut state, &candidates, obs);
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
     }
 }
 
-/// Drain queued passive throughput observations into health and subnet priors.
-///
-/// Called at the top of every probe loop iteration, before `build_candidates`,
-/// so even a cycle with no due probes still absorbs observations from traffic.
-fn drain_observations(state: &mut PoolState, timing: &ProbeTiming) {
-    let mut count = 0;
-    while let Ok(obs) = state.obs_rx.try_recv() {
-        if obs.elapsed.is_zero() || obs.bytes == 0 {
-            continue;
+/// Consume bounded telemetry batches while DNS or another asynchronous job is
+/// in flight. Receiving telemetry never restarts or delays the job's deadline.
+async fn with_observations<T>(
+    work: impl Future<Output = T>,
+    pool: &Arc<Pool>,
+    state: &mut PoolState,
+    candidates: &[Candidate],
+) -> T {
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            output = &mut work => return output,
+            obs = state.obs_rx.recv(), if state.observations_open => {
+                process_observations(pool, state, candidates, obs);
+                tokio::task::yield_now().await;
+            }
         }
-        let bps = obs.bytes as f64 / obs.elapsed.as_secs_f64();
-
-        // Log large transfers for visibility
-        if obs.bytes > 100_000 {
-            let throughput_mbps = bps / 1_000_000.0;
-            debug!(
-                addr = %obs.addr,
-                bytes = obs.bytes,
-                throughput_mbps = format!("{:.2}", throughput_mbps),
-                "observed passive throughput"
-            );
-        }
-
-        if let Some(h) = state.health.get_mut(&obs.addr) {
-            h.observe_throughput(obs.bytes, obs.elapsed, timing.throughput_discount);
-        }
-        // Update the subnet prior so siblings benefit from this observation.
-        let key = SubnetKey::of(obs.addr);
-        let subnet = state
-            .subnet_priors
-            .entry(key)
-            .or_insert_with(default_nig_prior);
-        subnet.observe(bps, timing.throughput_discount);
-        count += 1;
-    }
-
-    if count > 0 {
-        debug!(
-            observations = count,
-            subnet_priors = state.subnet_priors.len(),
-            "drained passive throughput observations"
-        );
     }
 }
+
+fn process_observations(
+    pool: &Arc<Pool>,
+    state: &mut PoolState,
+    candidates: &[Candidate],
+    first: Option<PassiveObs>,
+) {
+    let Some(first) = first else {
+        state.observations_open = false;
+        return;
+    };
+    let now = Instant::now();
+    let mut obs = Some(first);
+    let mut changed = false;
+    for _ in 0..OBSERVATION_BATCH {
+        let Some(value) = obs.take().or_else(|| state.obs_rx.try_recv().ok()) else {
+            break;
+        };
+        changed |= state.observe(value, pool.timing.throughput_discount, now);
+    }
+    if changed {
+        publish(pool, state, candidates);
+    }
+    if state.last_feedback_warning.elapsed() >= Duration::from_secs(60) {
+        let dropped = pool.dropped_observations.swap(0, Ordering::Relaxed);
+        if dropped != 0 {
+            warn!(pool = %pool.name, dropped, "pool telemetry capacity exceeded; new observations dropped");
+        }
+        state.last_feedback_warning = now;
+    }
+}
+
+async fn refresh_domains(pool: &Arc<Pool>, state: &mut PoolState, candidates: &[Candidate]) {
+    if state
+        .resolved_at
+        .is_some_and(|at| at.elapsed() < dns_refresh(pool, state))
+    {
+        return;
+    }
+    state.resolved_at = Some(Instant::now());
+    for target in &pool.targets {
+        if let TargetSpec::Domain(name) = &target.spec {
+            let lookup = pool.resolver.resolve_all(name, AddressFamily::Dual);
+            match with_observations(lookup, pool, state, candidates).await {
+                Ok(ips) => {
+                    state.resolved.insert(target.index, ips);
+                }
+                Err(e) => warn!(pool = %pool.name, target = target.index, domain = %name,
+                    error = %format!("{e:#}"), cached = state.resolved.contains_key(&target.index),
+                    "pool target did not resolve; keeping the previous addresses"),
+            }
+        }
+    }
+}
+
+/// DNS refresh cadence: fast retry until every domain has an initial answer.
 ///
 /// `interval` once every domain target has an answer, but `degraded_interval`
 /// while any of them has none. Without that distinction a failed *first*
@@ -1173,22 +1346,9 @@ fn next_due(pool: &Pool, state: &PoolState, candidates: &[Candidate]) -> Duratio
     wait.max(Duration::from_millis(50))
 }
 
-/// Expand every target into candidates, re-resolving domains and applying the
-/// NAT64 projection.
-async fn build_candidates(pool: &Arc<Pool>, state: &mut PoolState) -> Vec<Candidate> {
+/// Expand every target using cached DNS answers and apply the NAT64 projection.
+fn build_candidates(pool: &Arc<Pool>, state: &mut PoolState) -> Vec<Candidate> {
     let mut out: Vec<Candidate> = Vec::new();
-
-    // Domain targets are re-resolved on `interval`, not on every pass. The loop
-    // wakes on the earliest *due candidate*, which can be far more often than
-    // `interval` while anything is backing off — and DNS load must not rise just
-    // because part of the pool is unhealthy.
-    let dns_due = match state.resolved_at {
-        None => true,
-        Some(at) => at.elapsed() >= dns_refresh(pool, state),
-    };
-    if dns_due {
-        state.resolved_at = Some(Instant::now());
-    }
 
     for target in &pool.targets {
         match &target.spec {
@@ -1203,36 +1363,7 @@ async fn build_candidates(pool: &Arc<Pool>, state: &mut PoolState) -> Vec<Candid
                     push_candidate(&mut out, target, *ip);
                 }
             }
-            TargetSpec::Domain(name) => {
-                if dns_due {
-                    // Every address, both families. `Dual` rather than two
-                    // separate lookups because which family a pool should use is
-                    // the *consumer's* decision, expressed with `select` — so the
-                    // pool gathers everything the name publishes and tags each
-                    // candidate.
-                    //
-                    // And every address, not just the first: a name fronting
-                    // several edges is the ordinary case for the CDNs pools exist
-                    // to rank, and taking one record would silently discard the
-                    // alternatives this whole module is for.
-                    match pool.resolver.resolve_all(name, AddressFamily::Dual).await {
-                        Ok(ips) => {
-                            state.resolved.insert(target.index, ips);
-                        }
-                        // Keep the previous answer: a working-but-stale address
-                        // list beats none, since the endpoints behind it are still
-                        // measured and probably still up. Same reasoning the
-                        // resolver rebuild path uses on a failed refresh.
-                        Err(e) => warn!(
-                            pool = %pool.name,
-                            target = target.index,
-                            domain = %name,
-                            error = %format!("{e:#}"),
-                            cached = state.resolved.contains_key(&target.index),
-                            "pool target did not resolve; keeping the previous addresses"
-                        ),
-                    }
-                }
+            TargetSpec::Domain(_) => {
                 for ip in state.resolved.get(&target.index).into_iter().flatten() {
                     push_candidate(&mut out, target, *ip);
                 }
@@ -1302,6 +1433,10 @@ async fn build_candidates(pool: &Arc<Pool>, state: &mut PoolState) -> Vec<Candid
     let now = Instant::now();
     let live: HashSet<IpAddr> = out.iter().map(|c| c.addr).collect();
 
+    // Expire historical priors before newcomers can make their subnet live.
+    // Enforce the new parked-set cap after returning candidates are restored.
+    state.prune_history(now);
+
     // Move departing candidates into the parked map rather than discarding their state.
     let park_until = now + PARK_DURATION;
     let departing: Vec<IpAddr> = state
@@ -1315,9 +1450,6 @@ async fn build_candidates(pool: &Arc<Pool>, state: &mut PoolState) -> Vec<Candid
             state.parked.insert(addr, (h, park_until));
         }
     }
-    // Evict parked candidates whose retention window has expired.
-    state.parked.retain(|_, (_, expires)| *expires > now);
-
     for c in &out {
         if !state.health.contains_key(&c.addr) {
             let h = if let Some((parked_h, _)) = state.parked.remove(&c.addr) {
@@ -1333,7 +1465,7 @@ async fn build_candidates(pool: &Arc<Pool>, state: &mut PoolState) -> Vec<Candid
                 );
                 let key = SubnetKey::of(c.addr);
                 if let Some(subnet) = state.subnet_priors.get(&key) {
-                    h.nig = subnet.clone();
+                    h.nig = subnet.model.clone();
                 }
                 h
             };
@@ -1341,6 +1473,7 @@ async fn build_candidates(pool: &Arc<Pool>, state: &mut PoolState) -> Vec<Candid
         }
     }
 
+    state.prune_history(now);
     out
 }
 
@@ -1384,27 +1517,26 @@ async fn run_cycle(pool: &Arc<Pool>, state: &mut PoolState, candidates: &[Candid
         return;
     }
 
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(
-        pool.timing.max_concurrent_probes,
-    ));
+    let mut due = due.into_iter();
     let mut set = tokio::task::JoinSet::new();
-    for c in due {
-        let pool = pool.clone();
-        let semaphore = semaphore.clone();
-        // A NAT64 path carries an extra hop, so it may have its own bound.
-        let is_nat64 = c.tags.iter().any(|t| t == TAG_NAT64);
-        let budget = match (&pool.nat64, is_nat64) {
-            (Some(n), true) => n.timeout,
-            _ => pool.probe.timeout,
+    loop {
+        while set.len() < pool.timing.max_concurrent_probes {
+            let Some(c) = due.next() else {
+                break;
+            };
+            let pool = pool.clone();
+            let budget = match (&pool.nat64, c.tags.iter().any(|t| t == TAG_NAT64)) {
+                (Some(n), true) => n.timeout,
+                _ => pool.probe.timeout,
+            };
+            set.spawn(async move { (c.addr, probe_one(&pool, c.addr, budget).await) });
+        }
+        if set.is_empty() {
+            break;
+        }
+        let Some(joined) = with_observations(set.join_next(), pool, state, candidates).await else {
+            break;
         };
-        set.spawn(async move {
-            let _permit = semaphore.acquire().await;
-            let outcome = probe_one(&pool, c.addr, budget).await;
-            (c.addr, outcome)
-        });
-    }
-
-    while let Some(joined) = set.join_next().await {
         let Ok((addr, outcome)) = joined else {
             warn!(pool = %pool.name, "a probe task panicked");
             continue;
@@ -1457,13 +1589,15 @@ async fn run_cycle(pool: &Arc<Pool>, state: &mut PoolState, candidates: &[Candid
 }
 
 impl PoolState {
-    fn new(obs_rx: mpsc::UnboundedReceiver<PassiveObs>) -> Self {
+    fn new(obs_rx: mpsc::Receiver<PassiveObs>) -> Self {
         Self {
             health: HashMap::new(),
             order: Vec::new(),
             parked: HashMap::new(),
             subnet_priors: HashMap::new(),
             obs_rx,
+            observations_open: true,
+            last_feedback_warning: Instant::now(),
             last_logged_best: None,
             last_logged_healthy: 0,
             resampled: HashSet::new(),
@@ -1583,37 +1717,65 @@ fn recompute_order(state: &mut PoolState, timing: &ProbeTiming, candidates: &[Ca
 
 /// Publish the current order and every view's answer.
 fn publish(pool: &Arc<Pool>, state: &PoolState, candidates: &[Candidate]) {
-    let order = &state.order;
-
+    let old = pool
+        .ranking
+        .read()
+        .expect("pool ranking lock poisoned")
+        .clone();
+    let models: HashMap<_, _> = state
+        .health
+        .iter()
+        .filter_map(|(addr, h)| {
+            if h.degraded {
+                return None;
+            }
+            Some((
+                *addr,
+                Arc::new(SelectionModel {
+                    addr: *addr,
+                    rtt: h.rtt()?,
+                    throughput: h.nig.clone(),
+                }),
+            ))
+        })
+        .collect();
     let per_view = pool
         .views
         .iter()
-        .map(|view| {
-            let ordered: Vec<IpAddr> = order
+        .enumerate()
+        .map(|(index, view)| {
+            let eligible: HashSet<_> = candidates
                 .iter()
-                .filter(|addr| {
-                    candidates
-                        .iter()
-                        .any(|c| c.addr == **addr && c.matches(&view.selectors))
-                })
-                .copied()
+                .filter(|c| c.matches(&view.selectors))
+                .map(|c| c.addr)
                 .collect();
-
-            // The fallback is drawn from the fallback *target* under this view's
-            // own filter, so a `select = ["nat64"]` consumer falls back to a
-            // synthesized address rather than to a bare IPv4 its host may have
-            // no route to.
+            let ordered: Vec<_> = state
+                .order
+                .iter()
+                .filter(|addr| eligible.contains(addr))
+                .filter_map(|addr| models.get(addr).cloned())
+                .collect();
+            let previous = old
+                .per_view
+                .get(index)
+                .and_then(|v| v.ordered.get(v.incumbent.load(Ordering::Relaxed)))
+                .map(|m| m.addr);
+            let incumbent = previous
+                .and_then(|addr| ordered.iter().position(|m| m.addr == addr))
+                .unwrap_or(0);
             let fallback = pool.fallback.and_then(|t| {
                 candidates
                     .iter()
                     .find(|c| c.target == t && c.matches(&view.selectors))
                     .map(|c| c.addr)
             });
-
-            ViewRanking { ordered, fallback }
+            ViewRanking {
+                ordered,
+                fallback,
+                incumbent: AtomicUsize::new(incumbent),
+            }
         })
         .collect();
-
     *pool.ranking.write().expect("pool ranking lock poisoned") = Arc::new(Ranking { per_view });
 }
 
@@ -1633,10 +1795,13 @@ fn reorder_with_hysteresis(
 ) -> Vec<IpAddr> {
     let healthy = |addr: &IpAddr| -> Option<f64> {
         let h = state.health.get(addr)?;
-        if h.degraded || !h.kalman.is_converged() {
+        if h.degraded || !h.kalman.is_initialized() {
             return None;
         }
-        Some(score(&h.kalman, &h.nig, timing.score_payload_bytes))
+        Some(
+            h.kalman.estimate().as_secs_f64()
+                + timing.score_payload_bytes as f64 / h.nig.typical_bps(),
+        )
     };
     let live: HashSet<IpAddr> = candidates.iter().map(|c| c.addr).collect();
 
@@ -1680,13 +1845,13 @@ fn reorder_with_hysteresis(
     if tracing::enabled!(tracing::Level::DEBUG) && !order.is_empty() {
         for (i, addr) in order.iter().take(5).enumerate() {
             if let Some(h) = state.health.get(addr) {
-                let s = score(&h.kalman, &h.nig, timing.score_payload_bytes);
+                let s = healthy(addr).expect("ranked endpoint has a measurement");
                 debug!(
                     rank = i + 1,
                     addr = %addr,
                     score_s = format!("{:.3}", s),
                     rtt_ms = h.rtt().map(|d| d.as_millis()),
-                    "ranked candidate"
+                    "pool baseline candidate"
                 );
             }
         }
@@ -1718,7 +1883,7 @@ fn log_cycle(pool: &Arc<Pool>, state: &mut PoolState, candidates: &[Candidate]) 
     let best = snapshot
         .per_view
         .first()
-        .and_then(|v| v.ordered.first().copied());
+        .and_then(|v| v.ordered.first().map(|m| m.addr));
     let best_rtt = best
         .and_then(|a| state.health.get(&a))
         .and_then(|h| h.rtt())
@@ -1952,8 +2117,87 @@ fn parse_status(bytes: &[u8]) -> Result<u16> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
+
+    pub(super) fn fixture(payload: u64) -> (Arc<Pool>, PoolState, Vec<Candidate>) {
+        let (tx, rx) = mpsc::channel(OBSERVATION_CAPACITY);
+        let addr: IpAddr = "127.0.0.1".parse().unwrap();
+        let resolver = DnsResolver::new(
+            "test".into(),
+            crate::dns::ResolverSpec::System
+                .build(AddressFamily::Dual)
+                .unwrap(),
+            None,
+            None,
+        );
+        let pool = Arc::new(Pool {
+            name: "test".into(),
+            targets: vec![Target {
+                index: 0,
+                spec: TargetSpec::Ip(addr),
+                custom_tags: Arc::from([]),
+                sampled: Vec::new(),
+            }],
+            probe: ProbePlan {
+                port: 9,
+                timeout: Duration::from_millis(20),
+                kind: ProbeKind::Tcp,
+            },
+            timing: ProbeTiming {
+                interval: Duration::from_secs(300),
+                degraded_interval: Duration::from_secs(30),
+                fail_threshold: 2,
+                max_concurrent_probes: 16,
+                score_payload_bytes: payload,
+                throughput_discount: 0.95,
+                kalman_q: DEFAULT_KALMAN_Q,
+                kalman_r: DEFAULT_KALMAN_R,
+            },
+            nat64: None,
+            fallback: None,
+            resolver,
+            views: vec![View {
+                selectors: Vec::new(),
+            }],
+            ranking: RwLock::new(Arc::new(Ranking::empty(1))),
+            obs_tx: (payload != 0).then_some(tx),
+            dropped_observations: AtomicU64::new(0),
+        });
+        let mut state = PoolState::new(rx);
+        let mut h = Health::new(
+            Instant::now(),
+            Duration::from_secs(30),
+            DEFAULT_KALMAN_Q,
+            DEFAULT_KALMAN_R,
+        );
+        h.record_success(
+            Duration::from_millis(25),
+            pool.timing.interval,
+            pool.timing.degraded_interval,
+        );
+        state.health.insert(addr, h);
+        let candidates = vec![Candidate {
+            addr,
+            target: 0,
+            tags: vec!["ipv4".into()],
+        }];
+        recompute_order(&mut state, &pool.timing, &candidates);
+        publish(&pool, &state, &candidates);
+        (pool, state, candidates)
+    }
+
+    pub(crate) fn observer() -> (PoolHandle, mpsc::Receiver<PassiveObs>) {
+        let (pool, state, _) = fixture(1_000_000);
+        (PoolBuilder::handle(pool, 0), state.obs_rx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::fixture;
+    use super::*;
+    use crate::scoring::default_nig_prior;
 
     /// `Host` carries the port exactly when it is not the scheme's default, and
     /// the request target carries the query. Both are rendered once at startup,
@@ -2206,7 +2450,7 @@ mod tests {
     }
 
     fn state_with(rtts: &[(&str, Option<u64>, bool)]) -> PoolState {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(OBSERVATION_CAPACITY);
         let mut health = HashMap::new();
         for (addr, ms, degraded) in rtts {
             let mut h = Health::new(
@@ -2228,7 +2472,7 @@ mod tests {
         PoolState {
             health,
             obs_rx: rx,
-            ..PoolState::new(mpsc::unbounded_channel().1)
+            ..PoolState::new(mpsc::channel(OBSERVATION_CAPACITY).1)
         }
     }
 
@@ -2481,5 +2725,240 @@ mod tests {
         assert!(parse_status(b"SSH-2.0-OpenSSH\r\n").is_err());
         assert!(parse_status(b"HTTP/1.1\r\n").is_err());
         assert!(parse_status(b"HTTP/1.1 abc OK\r\n").is_err());
+    }
+
+    fn models() -> Vec<Arc<SelectionModel>> {
+        (1..=32)
+            .map(|i| {
+                Arc::new(SelectionModel {
+                    addr: std::net::Ipv4Addr::new(192, 0, 2, i).into(),
+                    rtt: Duration::from_millis(20),
+                    throughput: default_nig_prior(),
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn each_candidate_is_scored_once_and_position_does_not_change_winner() {
+        let mut models = models();
+        let wanted = models[31].addr;
+        for _ in 0..32 {
+            let mut seen = std::collections::HashSet::new();
+            let chosen = choose_with(&models, &AtomicUsize::new(0), |m| {
+                assert!(seen.insert(m.addr), "candidate sampled twice");
+                if m.addr == wanted {
+                    0.01
+                } else {
+                    1.0
+                }
+            });
+            assert_eq!(chosen, Some(wanted));
+            assert_eq!(seen.len(), models.len());
+            models.rotate_left(1);
+        }
+    }
+
+    #[test]
+    fn repeated_connections_explore_without_republishing() {
+        let models = models();
+        let incumbent = AtomicUsize::new(0);
+        let choices: std::collections::HashSet<_> = (0..2000)
+            .map(|_| choose_candidate(&models, &incumbent, 1_000_000).unwrap())
+            .collect();
+        assert!(
+            choices.len() > 16,
+            "only explored {} endpoints",
+            choices.len()
+        );
+        for _ in 0..100 {
+            assert_eq!(
+                choose_candidate(&models, &incumbent, 0),
+                Some(models[0].addr)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_feedback_and_disabled_scoring_do_not_grow_backlogs() {
+        for payload in [0, 1_000_000] {
+            let (pool, state, candidates) = fixture(payload);
+            let handle = PoolBuilder::handle(pool.clone(), 0);
+            for _ in 0..100_000 {
+                handle.observe_transfer(candidates[0].addr, 1024, Duration::from_millis(1));
+            }
+            let accepted = if payload == 0 {
+                0
+            } else {
+                OBSERVATION_CAPACITY
+            };
+            assert_eq!(state.obs_rx.len(), accepted);
+            assert_eq!(
+                pool.dropped_observations.load(Ordering::Relaxed),
+                if payload == 0 {
+                    0
+                } else {
+                    100_000 - accepted as u64
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn one_batch_has_a_fixed_work_budget() {
+        let (pool, mut state, candidates) = fixture(1_000_000);
+        let handle = PoolBuilder::handle(pool.clone(), 0);
+        for _ in 0..OBSERVATION_CAPACITY {
+            handle.observe_transfer(candidates[0].addr, 1024, Duration::from_millis(1));
+        }
+        let first = state.obs_rx.recv().await;
+        process_observations(&pool, &mut state, &candidates, first);
+        assert_eq!(state.obs_rx.len(), OBSERVATION_CAPACITY - OBSERVATION_BATCH);
+    }
+
+    #[tokio::test]
+    async fn observations_publish_while_other_work_is_pending() {
+        let (pool, mut state, candidates) = fixture(1_000_000);
+        let handle = PoolBuilder::handle(pool.clone(), 0);
+        let addr = candidates[0].addr;
+        let before = state.health[&addr].nig.mu;
+        let worker_pool = pool.clone();
+        let worker = tokio::spawn(async move {
+            with_observations(
+                std::future::pending::<()>(),
+                &worker_pool,
+                &mut state,
+                &candidates,
+            )
+            .await;
+        });
+        handle.observe_transfer(addr, 1_000_000, Duration::from_millis(1));
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let mu = pool.ranking.read().unwrap().per_view[0].ordered[0]
+                    .throughput
+                    .mu;
+                if mu > before {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("feedback waited for unrelated work");
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn parked_transfers_update_the_state_restored_after_dns_rotation() {
+        let (pool, mut state, candidates) = fixture(1_000_000);
+        let addr = candidates[0].addr;
+        let h = state.health.remove(&addr).unwrap();
+        let before = h.nig.mu;
+        let now = Instant::now();
+        state.parked.insert(addr, (h, now + PARK_DURATION));
+        state.observe(
+            PassiveObs {
+                addr,
+                bytes: 1_000_000,
+                elapsed: Duration::from_millis(1),
+            },
+            0.95,
+            now,
+        );
+        let updated = state.parked[&addr].0.nig.mu;
+        assert!(updated > before);
+        build_candidates(&pool, &mut state);
+        assert_eq!(state.health[&addr].nig.mu, updated);
+        assert!(!state.parked.contains_key(&addr));
+    }
+
+    #[tokio::test]
+    async fn history_is_bounded_and_expired_observations_cannot_resurrect_it() {
+        let (_, mut state, candidates) = fixture(1_000_000);
+        let now = Instant::now();
+        let h = state.health[&candidates[0].addr].clone();
+        for index in 0..(MAX_PARKED_CANDIDATES + 100) {
+            let addr = IpAddr::V4(Ipv4Addr::new(10, (index / 256) as u8, index as u8, 1));
+            state.parked.insert(addr, (h.clone(), now + PARK_DURATION));
+            state.subnet_priors.insert(
+                SubnetKey::of(addr),
+                SubnetPrior {
+                    model: default_nig_prior(),
+                    last_used: now,
+                },
+            );
+        }
+        state.prune_history(now);
+        assert_eq!(state.parked.len(), MAX_PARKED_CANDIDATES);
+        assert!(state.subnet_priors.len() <= MAX_PARKED_CANDIDATES + MAX_IDLE_SUBNET_PRIORS);
+        let later = now + PARK_DURATION + Duration::from_secs(1);
+        state.prune_history(later);
+        assert!(state.parked.is_empty());
+        assert!(state.subnet_priors.is_empty());
+        state.observe(
+            PassiveObs {
+                addr: "10.0.0.1".parse().unwrap(),
+                bytes: 1024,
+                elapsed: Duration::from_secs(1),
+            },
+            0.95,
+            later,
+        );
+        assert!(state.subnet_priors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn new_candidates_cannot_revive_expired_subnet_priors() {
+        for expired in [false, true] {
+            let (pool, mut state, candidates) = fixture(1_000_000);
+            let addr = candidates[0].addr;
+            let key = SubnetKey::of(addr);
+            let now = Instant::now();
+            let mut learned = default_nig_prior();
+            learned.observe(1_000_000_000.0, 0.95);
+            let expected = if expired {
+                default_nig_prior()
+            } else {
+                learned.clone()
+            };
+            state.health.clear();
+            state.subnet_priors.insert(
+                key,
+                SubnetPrior {
+                    model: learned,
+                    last_used: if expired {
+                        now - PARK_DURATION - Duration::from_secs(1)
+                    } else {
+                        now
+                    },
+                },
+            );
+
+            build_candidates(&pool, &mut state);
+
+            let actual = &state.health[&addr].nig;
+            assert_eq!(actual.mu, expected.mu);
+            assert_eq!(actual.kappa, expected.kappa);
+            assert_eq!(actual.alpha, expected.alpha);
+            assert_eq!(actual.beta, expected.beta);
+            assert_eq!(state.subnet_priors.contains_key(&key), !expired);
+        }
+    }
+
+    #[tokio::test]
+    async fn high_measurement_noise_does_not_exclude_healthy_endpoints() {
+        let (pool, mut state, candidates) = fixture(1_000_000);
+        let addr = candidates[0].addr;
+        let h = state.health.get_mut(&addr).unwrap();
+        h.kalman = KalmanRtt::new(10.0, 10.0);
+        for _ in 0..1000 {
+            h.kalman.update(Duration::from_millis(50));
+        }
+        assert!(h.kalman.variance > 5.0);
+        recompute_order(&mut state, &pool.timing, &candidates);
+        publish(&pool, &state, &candidates);
+        assert_eq!(pool.pick(0, 443).unwrap().ip(), addr);
     }
 }

@@ -120,11 +120,11 @@ addr = "127.0.0.1:{listen}"
 
     assert!(resp.contains("200 OK"), "backend not reached");
     assert!(
-        bootstrap_mock.asked("resolver-a.example"),
+        eventually(|| bootstrap_mock.asked("resolver-a.example")),
         "bootstrap resolver was not asked for the endpoint host"
     );
     assert!(
-        resolver_a_mock.asked("upstream.test"),
+        eventually(|| resolver_a_mock.asked("upstream.test")),
         "resolver-a was not asked for upstream"
     );
 }

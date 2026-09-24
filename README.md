@@ -844,19 +844,18 @@ score_payload_bytes = 1_000_000  # 1 MB reference payload
 The gateway learns throughput from completed connections and uses **Thompson
 Sampling** to balance routing to known-good candidates (exploitation) with
 discovering better alternatives (exploration). Candidates with uncertain
-throughput occasionally draw optimistic samples and get traffic, converging
-toward the true best without manual tuning.
+throughput occasionally draw optimistic samples and get traffic. Each connection
+samples every eligible candidate once; feedback is consumed independently of
+active-probe scheduling. Learning depends on the traffic actually observed.
 
 **Hierarchical priors:** Candidates are grouped by `/24` (IPv4) or `/48` (IPv6)
 subnet. Observations on one candidate improve the initial estimate for siblings
 in the same subnet, accelerating learning in large pools.
 
-**Backward compatible:** `score_payload_bytes = 0` (the default) is pure RTT
-ranking with zero behavior change. Set it to your typical transfer size (100 KB
+**Default:** `score_payload_bytes = 0` is pure RTT ranking and disables transfer
+telemetry. RTT smoothing uses Kalman, so exact rankings can differ from the earlier
+EWMA estimator. Set it to your typical transfer size (100 KB
 for images, 10 MB for video) to enable adaptive routing.
-
-See [`docs/pools.md`](docs/pools.md) for tuning details, convergence
-characteristics, and worked examples.
 
 ### NAT64 projection
 

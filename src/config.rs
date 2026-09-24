@@ -1393,7 +1393,7 @@ pub struct ProbeDef {
     #[serde(default)]
     pub fail_threshold: Option<u32>,
 
-    /// Maximum simultaneous probes within one cycle. Default 16.
+    /// Maximum simultaneous probes and tasks, from 1 to 4096. Default 16.
     #[serde(default)]
     pub max_concurrent_probes: Option<usize>,
 
@@ -1403,7 +1403,7 @@ pub struct ProbeDef {
     /// Reference payload size in bytes used to compute the effective-time
     /// score: `rtt + payload_bytes / sampled_throughput`. Zero (default)
     /// disables throughput sampling entirely and scores on RTT alone,
-    /// preserving the pre-existing behaviour.
+    /// without collecting transfer telemetry.
     #[serde(default)]
     pub score_payload_bytes: Option<u64>,
 
@@ -1506,12 +1506,17 @@ fn meaningless(field: &str, mode: &str, why: &str) -> String {
 impl ProbeDef {
     /// Validate one probe table and reduce it to the fields its mode uses.
     ///
-    /// Both the config checker and the pool builder call this, so a probe that
-    /// loads is a probe that builds: there is no second reduction that could
-    /// drift from this one. The error message carries no scope prefix — every
-    /// caller knows which pool it is validating and adds its own.
+    /// The config checker and startup use this same reduction. The pool builder
+    /// receives the resulting spec and checks shared parameters separately.
+    /// Errors carry no scope prefix; callers add the pool being validated.
     pub fn validate(&self) -> Result<ProbeSpec, String> {
         let spec = self.reduce()?;
+        self.validate_parameters()?;
+        Ok(spec)
+    }
+
+    /// Validate shared timing and scoring parameters without reducing the mode.
+    pub(crate) fn validate_parameters(&self) -> Result<(), String> {
         for (name, value) in [
             ("timeout", self.timeout),
             ("interval", self.interval),
@@ -1528,7 +1533,31 @@ impl ProbeDef {
                     .to_string(),
             );
         }
-        Ok(spec)
+        if self
+            .max_concurrent_probes
+            .is_some_and(|n| n == 0 || n > 4096)
+        {
+            return Err("`max_concurrent_probes` must be between 1 and 4096".into());
+        }
+        if self
+            .throughput_discount
+            .is_some_and(|v| !v.is_finite() || v <= 0.0 || v > 1.0)
+        {
+            return Err("`throughput_discount` must be finite and in (0, 1]".into());
+        }
+        if self
+            .rtt_process_noise
+            .is_some_and(|v| !v.is_finite() || v < 0.0)
+        {
+            return Err("`rtt_process_noise` must be finite and nonnegative".into());
+        }
+        if self
+            .rtt_obs_noise
+            .is_some_and(|v| !v.is_finite() || v <= 0.0)
+        {
+            return Err("`rtt_obs_noise` must be finite and positive".into());
+        }
+        Ok(())
     }
 
     fn reduce(&self) -> Result<ProbeSpec, String> {
@@ -6116,5 +6145,54 @@ addr = "0.0.0.0:443"
         )
         .validate()
         .unwrap();
+    }
+
+    #[test]
+    fn invalid_pool_model_parameters_are_rejected_at_load_time() {
+        for (field, bad_values) in [
+            (
+                "max_concurrent_probes",
+                &["0", "4097", "9223372036854775807"][..],
+            ),
+            (
+                "throughput_discount",
+                &["0.0", "-0.5", "1.1", "nan", "inf", "-inf"],
+            ),
+            ("rtt_process_noise", &["-0.01", "nan", "inf", "-inf"]),
+            ("rtt_obs_noise", &["0.0", "-999.0", "nan", "inf", "-inf"]),
+        ] {
+            for value in bad_values {
+                let probe: ProbeDef =
+                    toml::from_str(&format!("mode = \"tcp\"\n{field} = {value}")).unwrap();
+                let error = probe.validate().unwrap_err();
+                assert!(error.contains(field), "{field}={value}: {error}");
+            }
+        }
+        for settings in [
+            "max_concurrent_probes = 1\nthroughput_discount = 1.0\nrtt_process_noise = 0.0\nrtt_obs_noise = 0.1",
+            "max_concurrent_probes = 4096\nrtt_process_noise = 10.0\nrtt_obs_noise = 10.0",
+            "rtt_process_noise = 1e308\nrtt_obs_noise = 1e308",
+        ] {
+            let probe: ProbeDef = toml::from_str(&format!("mode = \"tcp\"\n{settings}")).unwrap();
+            probe.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn commented_adaptive_example_loads_when_enabled() {
+        let template = include_str!("../sni-gate.example.toml");
+        let (_, section) = template
+            .split_once("# [pools.cdn-adaptive]")
+            .expect("adaptive pool example marker is present");
+        let (example, _) = section
+            .split_once("# The gateway learns")
+            .expect("adaptive pool example terminator is present");
+        let uncommented: String = example
+            .lines()
+            .map(|line| format!("{}\n", line.strip_prefix("# ").unwrap_or(line)))
+            .collect();
+        let full = format!("[ca]\ncert_path=\"ca.crt\"\nkey_path=\"ca.key\"\n[pools.cdn-adaptive]\n{uncommented}\n[[listener]]\naddr=\"127.0.0.1:8443\"\n[[listener.route]]\ntype=\"tls\"\nmatch_sni=[\"media.example.com\"]\nupstream=\"@cdn-adaptive:443\"\n");
+        let config: Config = toml::from_str(&full).unwrap();
+        config.validate().unwrap();
     }
 }

@@ -30,17 +30,18 @@
 //!   TLS. A startup probe (`src/probe.rs`) validates that the backend really
 //!   speaks h2c, but never silently downgrades the route.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use rustls::client::EchStatus;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ServerConfig};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 use tokio::time::timeout;
 use tokio_rustls::{LazyConfigAcceptor, TlsConnector};
 use tracing::{debug, info, warn};
@@ -570,20 +571,8 @@ async fn serve_mirrored(
 
     let tls = start.into_stream(config).await?;
 
-    // Extract upstream address before moving streams into splice
-    let upstream_addr = up.get_ref().0.peer_addr().ok();
-    let start_time = std::time::Instant::now();
-    let result = splice(tls, up, rt.idle_timeout).await;
-
-    // Report passive throughput observation to pool
-    if let (Ok((bytes_c2u, bytes_u2c)), Some(addr)) = (&result, upstream_addr) {
-        if let Upstream::Pool(handle) = &rt.upstream {
-            let elapsed = start_time.elapsed();
-            let total_bytes = bytes_c2u + bytes_u2c;
-            handle.observe_transfer(addr.ip(), total_bytes, elapsed);
-        }
-    }
-    result.map(|_| ())
+    let observer = transfer_observer(rt, up.get_ref().0.peer_addr().ok());
+    splice(tls, up, rt.idle_timeout, observer).await
 }
 
 /// Forward a cleartext inbound connection (no inbound TLS).
@@ -618,17 +607,8 @@ where
     match rt.route_type {
         RouteType::Http => {
             let up = dial(upstream_addrs, rt.connect_timeout).await?;
-            let upstream_addr = up.peer_addr().ok();
-            let start_time = std::time::Instant::now();
-            let result = splice(inbound, up, rt.idle_timeout).await;
-            if let (Ok((bytes_c2u, bytes_u2c)), Some(addr)) = (&result, upstream_addr) {
-                if let Upstream::Pool(handle) = &rt.upstream {
-                    let elapsed = start_time.elapsed();
-                    let total_bytes = bytes_c2u + bytes_u2c;
-                    handle.observe_transfer(addr.ip(), total_bytes, elapsed);
-                }
-            }
-            result.map(|_| ())
+            let observer = transfer_observer(rt, up.peer_addr().ok());
+            splice(inbound, up, rt.idle_timeout, observer).await
         }
         // These arms are only reached on the non-mirrored path (HTTP/2 disabled),
         // where inbound was negotiated as http/1.1 — so offer nothing upstream
@@ -640,33 +620,15 @@ where
             // later connection for the same name can, and this is a free look at
             // what the upstream's certificate covers.
             record_upstream_coverage(state, rt, sni.as_ref(), up.get_ref().1);
-            let upstream_addr = up.get_ref().0.peer_addr().ok();
-            let start_time = std::time::Instant::now();
-            let result = splice(inbound, up, rt.idle_timeout).await;
-            if let (Ok((bytes_c2u, bytes_u2c)), Some(addr)) = (&result, upstream_addr) {
-                if let Upstream::Pool(handle) = &rt.upstream {
-                    let elapsed = start_time.elapsed();
-                    let total_bytes = bytes_c2u + bytes_u2c;
-                    handle.observe_transfer(addr.ip(), total_bytes, elapsed);
-                }
-            }
-            result.map(|_| ())
+            let observer = transfer_observer(rt, up.get_ref().0.peer_addr().ok());
+            splice(inbound, up, rt.idle_timeout, observer).await
         }
         RouteType::Ech => {
             let inner = ech_inner_name(rt, &sni)?;
             let up = dial_ech(upstream_addrs, &inner, peer, rt, &[]).await?;
             record_upstream_coverage(state, rt, sni.as_ref(), up.get_ref().1);
-            let upstream_addr = up.get_ref().0.peer_addr().ok();
-            let start_time = std::time::Instant::now();
-            let result = splice(inbound, up, rt.idle_timeout).await;
-            if let (Ok((bytes_c2u, bytes_u2c)), Some(addr)) = (&result, upstream_addr) {
-                if let Upstream::Pool(handle) = &rt.upstream {
-                    let elapsed = start_time.elapsed();
-                    let total_bytes = bytes_c2u + bytes_u2c;
-                    handle.observe_transfer(addr.ip(), total_bytes, elapsed);
-                }
-            }
-            result.map(|_| ())
+            let observer = transfer_observer(rt, up.get_ref().0.peer_addr().ok());
+            splice(inbound, up, rt.idle_timeout, observer).await
         }
         RouteType::Raw => unreachable!("raw handled before termination"),
     }
@@ -945,84 +907,120 @@ fn is_ech_reject(e: &std::io::Error) -> bool {
     crate::ech::is_ech_reject_io(e)
 }
 
-/// Splice bytes bidirectionally, enforcing a true **idle** timeout: the clock
-/// resets on every chunk in either direction, so long-lived but active
-/// connections (WebSocket, streaming) are never cut — only genuinely idle ones.
-/// `idle` of zero disables the timeout.
-///
-/// Both directions are driven to completion independently (a half-close in one
-/// direction does not tear down the other), so request/response and duplex
-/// protocols both work. The splice ends when both directions have closed, or
-/// when the idle timeout fires, whichever comes first.
-///
-/// Returns `(bytes_a_to_b, bytes_b_to_a)` on success.
-async fn splice<A, B>(a: A, b: B, idle: Duration) -> Result<(u64, u64)>
+struct Report<'a> {
+    observer: Option<(&'a PoolHandle, IpAddr)>,
+    started: Instant,
+    upload: u64,
+    download: u64,
+}
+
+impl Drop for Report<'_> {
+    fn drop(&mut self) {
+        let Some((pool, addr)) = self.observer else {
+            return;
+        };
+        let bytes = self.upload.saturating_add(self.download);
+        if bytes == 0 {
+            return;
+        }
+        // TCP EOF says nothing about application-level completion. Keep the
+        // entire forwarding lifetime for every exit, including normal EOF,
+        // so a missing or truncated response cannot hide its waiting time.
+        let elapsed = self.started.elapsed().max(Duration::from_nanos(1));
+        pool.observe_transfer(addr, bytes, elapsed);
+    }
+}
+
+pub(super) async fn splice<A, B>(
+    a: A,
+    b: B,
+    idle: Duration,
+    observer: Option<(&PoolHandle, IpAddr)>,
+) -> Result<()>
 where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
     let (mut ar, mut aw) = tokio::io::split(a);
     let (mut br, mut bw) = tokio::io::split(b);
-    let activity = Arc::new(tokio::sync::Notify::new());
-
-    // Run both directions to completion; only the idle guard races them.
-    let both = async {
-        let a2b = pump_direction(&mut ar, &mut bw, &activity);
-        let b2a = pump_direction(&mut br, &mut aw, &activity);
-        let (r1, r2) = tokio::join!(a2b, b2a);
-        let bytes_a2b = r1.context("proxying data (c->u)")?;
-        let bytes_b2a = r2.context("proxying data (u->c)")?;
-        Ok::<(u64, u64), anyhow::Error>((bytes_a2b, bytes_b2a))
+    let activity = Notify::new();
+    let mut report = Report {
+        observer,
+        started: Instant::now(),
+        upload: 0,
+        download: 0,
     };
-
+    let tracked = report.observer.is_some();
+    let both = async {
+        let a2b = async {
+            pump(&mut ar, &mut bw, &activity, &mut report.upload, tracked)
+                .await
+                .context("proxying data (c->u)")
+        };
+        let b2a = async {
+            pump(&mut br, &mut aw, &activity, &mut report.download, tracked)
+                .await
+                .context("proxying data (u->c)")
+        };
+        // EOF in one direction still allows the other to finish. An I/O error
+        // ends the splice immediately, including when idle timeout is disabled.
+        tokio::try_join!(a2b, b2a)?;
+        Ok(())
+    };
     tokio::select! {
-        r = both => r,
+        result = both => result,
         _ = idle_guard(&activity, idle) => Err(anyhow!("idle timeout")),
     }
 }
 
-/// Copy one direction, signaling `activity` on every chunk. On EOF it
-/// half-closes the writer (so the peer sees the close) and returns the total
-/// bytes transferred, leaving the other direction free to continue.
-async fn pump_direction<R, W>(
+async fn pump<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: &mut R,
     writer: &mut W,
-    activity: &tokio::sync::Notify,
-) -> Result<u64>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    use tokio::io::AsyncReadExt;
+    activity: &Notify,
+    bytes: &mut u64,
+    tracked: bool,
+) -> Result<()> {
     let mut buf = vec![0u8; COPY_BUF_SIZE];
-    let mut total = 0u64;
     loop {
         let n = reader.read(&mut buf).await?;
         if n == 0 {
-            let _ = writer.shutdown().await;
-            return Ok(total);
+            writer.shutdown().await?;
+            return Ok(());
         }
-        writer.write_all(&buf[..n]).await?;
-        total += n as u64;
-        activity.notify_one();
+        let mut sent = 0;
+        while sent < n {
+            let written = writer.write(&buf[sent..n]).await?;
+            if written == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
+            }
+            if tracked {
+                *bytes = bytes.saturating_add(written as u64);
+            }
+            sent += written;
+            activity.notify_one();
+        }
     }
 }
 
-/// Resolve only when no activity has been signaled for `idle`. Never resolves
-/// when `idle` is zero (timeout disabled). `Notify` holds a single permit, so a
-/// notification arriving between `.notified()` awaits is not lost — it is
-/// consumed by the next await, correctly resetting the clock.
-async fn idle_guard(activity: &tokio::sync::Notify, idle: Duration) {
+async fn idle_guard(activity: &Notify, idle: Duration) {
     if idle.is_zero() {
         std::future::pending::<()>().await;
-        return;
     }
-    loop {
-        match timeout(idle, activity.notified()).await {
-            Ok(()) => continue, // activity: reset the idle clock
-            Err(_) => return,   // no activity within `idle`: time out
-        }
+    while timeout(idle, activity.notified()).await.is_ok() {}
+}
+
+/// Observation is opt-in, avoiding per-write counters and clock reads when disabled.
+fn transfer_observer(
+    rt: &RouteRuntime,
+    addr: Option<SocketAddr>,
+) -> Option<(&PoolHandle, std::net::IpAddr)> {
+    let Upstream::Pool(handle) = &rt.upstream else {
+        return None;
+    };
+    if !handle.observes_transfers() {
+        return None;
     }
+    Some((handle, addr?.ip()))
 }
 
 /// Raw byte-pump passthrough (no termination, no cert). Because nothing is
@@ -1046,28 +1044,14 @@ async fn raw_passthrough(
 
     match dialed {
         Ok(up) => {
-            let upstream_addr = up.peer_addr().ok();
-            let start_time = std::time::Instant::now();
-            let result = splice_tcp(client, up, rt.idle_timeout).await;
-            if let (Ok((bytes_c2u, bytes_u2c)), Some(addr)) = (&result, upstream_addr) {
-                if let Upstream::Pool(handle) = &rt.upstream {
-                    let elapsed = start_time.elapsed();
-                    let total_bytes = bytes_c2u + bytes_u2c;
-                    handle.observe_transfer(addr.ip(), total_bytes, elapsed);
-                }
-            }
-            result.map(|_| ())
+            let observer = transfer_observer(rt, up.peer_addr().ok());
+            splice(client, up, rt.idle_timeout, observer).await
         }
         Err(e) => {
             debug!(%peer, route = %rt.name, error = %format!("{e:#}"), "raw upstream failed; applying fail policy");
             apply_fail(client, peer, inbound, &rt.fail, "raw-fail").await
         }
     }
-}
-
-/// Raw TCP splice with the same true-idle-timeout semantics as [`splice`].
-async fn splice_tcp(a: TcpStream, b: TcpStream, idle: Duration) -> Result<(u64, u64)> {
-    splice(a, b, idle).await
 }
 
 /// Apply a fail/unmatched policy to a never-decrypted stream.
@@ -1085,9 +1069,7 @@ async fn apply_fail(
         }
         FailPolicy::Passthrough { addr } => {
             let up = dial(ResolvedAddrs::single(*addr), Duration::from_secs(10)).await?;
-            splice_tcp(client, up, Duration::from_secs(120))
-                .await
-                .map(|_| ())
+            splice(client, up, Duration::from_secs(120), None).await
         }
         FailPolicy::SystemOutbound => {
             let host = inbound
@@ -1097,9 +1079,7 @@ async fn apply_fail(
             let host = strip_port(host);
             let up = TcpStream::connect((host.as_str(), port)).await?;
             up.set_nodelay(true).ok();
-            splice_tcp(client, up, Duration::from_secs(120))
-                .await
-                .map(|_| ())
+            splice(client, up, Duration::from_secs(120), None).await
         }
     }
 }
@@ -1125,6 +1105,10 @@ fn strip_port(host: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context as TaskContext, Poll};
+    use tokio::io::ReadBuf;
 
     /// A listening socket plus its address. Held by the caller so the port
     /// stays bound for the duration of a test.
@@ -1239,9 +1223,7 @@ mod tests {
 
         // splice() bridges the two gate ends.
         let spliced = tokio::spawn(async move {
-            splice(client_gate, upstream_gate, Duration::from_secs(5))
-                .await
-                .map(|_| ())
+            splice(client_gate, upstream_gate, Duration::from_secs(5), None).await
         });
 
         let big = vec![0xABu8; 256 * 1024];
@@ -1356,5 +1338,312 @@ mod tests {
             rustls::PeerIncompatible::ServerRejectedEncryptedClientHello(None),
         ));
         assert!(is_ech_reject(&real));
+    }
+
+    fn assert_stalled_sample_is_slow(obs: &crate::pool::PassiveObs, wait: Duration) {
+        use crate::scoring::{default_nig_prior, score};
+        use rand::SeedableRng;
+
+        assert!(obs.elapsed >= wait);
+        let mut stalled = default_nig_prior();
+        let mut responsive = default_nig_prior();
+        for _ in 0..30 {
+            stalled.observe(obs.bytes as f64 / obs.elapsed.as_secs_f64(), 0.95);
+            responsive.observe(8192.0 / 0.03, 0.95);
+        }
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let rtt = Duration::from_millis(1);
+        let stalled_wins = (0..10_000)
+            .filter(|_| {
+                score(rtt, &stalled, 1_000_000, &mut rng)
+                    < score(rtt, &responsive, 1_000_000, &mut rng)
+            })
+            .count();
+        assert!(
+            stalled_wins < 100,
+            "stalled upstream won {stalled_wins}/10000"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_keeps_counts_and_waiting_time() {
+        let (handle, mut observations) = crate::pool::test_support::observer();
+        let (mut client, gate_client) = tokio::io::duplex(8192);
+        let (gate_upstream, mut upstream) = tokio::io::duplex(8192);
+        let worker = tokio::spawn(async move {
+            splice(
+                gate_client,
+                gate_upstream,
+                Duration::from_millis(100),
+                Some((&handle, "127.0.0.1".parse().unwrap())),
+            )
+            .await
+        });
+        let payload = [42u8; 4096];
+        upstream.write_all(&payload).await.unwrap();
+        let mut received = [0u8; 4096];
+        client.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, payload);
+        assert!(worker
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("idle timeout"));
+        let obs = observations.recv().await.unwrap();
+        assert_eq!(obs.bytes, 4096);
+        assert!(obs.elapsed >= Duration::from_millis(100));
+        assert!(
+            observations.try_recv().is_err(),
+            "reported the same connection twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_still_reports_already_forwarded_bytes() {
+        let (handle, mut observations) = crate::pool::test_support::observer();
+        let (mut client, gate_client) = tokio::io::duplex(128);
+        let (gate_upstream, mut upstream) = tokio::io::duplex(128);
+        let worker = tokio::spawn(async move {
+            splice(
+                gate_client,
+                gate_upstream,
+                Duration::ZERO,
+                Some((&handle, "127.0.0.1".parse().unwrap())),
+            )
+            .await
+        });
+        upstream.write_all(b"response").await.unwrap();
+        let mut received = [0u8; 8];
+        client.read_exact(&mut received).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        let obs = observations.recv().await.unwrap();
+        assert_eq!(obs.bytes, 8);
+        assert!(obs.elapsed >= Duration::from_millis(40));
+    }
+
+    #[tokio::test]
+    async fn stalled_responses_do_not_learn_faster_than_successful_transfers() {
+        // Cover both a silent upstream and one that sends only a response prefix.
+        for response in [b"".as_slice(), b"HTTP/1.1 200 OK\r\n"] {
+            let (handle, mut observations) = crate::pool::test_support::observer();
+            let (mut client, gate_client) = tokio::io::duplex(128);
+            let (gate_upstream, mut upstream) = tokio::io::duplex(128);
+            let request = b"GET / HTTP/1.1\r\nHost: test\r\n\r\n";
+            client.write_all(request).await.unwrap();
+            let worker = tokio::spawn(async move {
+                splice(
+                    gate_client,
+                    gate_upstream,
+                    Duration::from_millis(40),
+                    Some((&handle, "127.0.0.1".parse().unwrap())),
+                )
+                .await
+            });
+            let mut received = vec![0; request.len()];
+            upstream.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, request);
+            upstream.write_all(response).await.unwrap();
+            let mut received = vec![0; response.len()];
+            client.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, response);
+            assert!(worker
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("idle timeout"));
+
+            let obs = observations.try_recv().unwrap();
+            assert_eq!(obs.bytes, (request.len() + response.len()) as u64);
+            assert_stalled_sample_is_slow(&obs, Duration::from_millis(40));
+            assert!(observations.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn normal_eof_does_not_hide_missing_or_truncated_response() {
+        for response in [
+            b"".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 8192\r\n\r\nx",
+        ] {
+            let (handle, mut observations) = crate::pool::test_support::observer();
+            let (mut client, gate_client) = tokio::io::duplex(128);
+            let (gate_upstream, mut upstream) = tokio::io::duplex(128);
+            let request = b"GET / HTTP/1.1\r\nHost: test\r\n\r\n";
+            client.write_all(request).await.unwrap();
+            client.shutdown().await.unwrap();
+            let wait = Duration::from_millis(40);
+            let (result, ()) = tokio::join!(
+                splice(
+                    gate_client,
+                    gate_upstream,
+                    Duration::from_secs(1),
+                    Some((&handle, "127.0.0.1".parse().unwrap())),
+                ),
+                async {
+                    let mut received = Vec::new();
+                    upstream.read_to_end(&mut received).await.unwrap();
+                    assert_eq!(received, request);
+                    upstream.write_all(response).await.unwrap();
+                    tokio::time::sleep(wait).await;
+                    upstream.shutdown().await.unwrap();
+                }
+            );
+            result.unwrap();
+            let mut received = Vec::new();
+            client.read_to_end(&mut received).await.unwrap();
+            assert_eq!(received, response);
+            let obs = observations.try_recv().unwrap();
+            assert_eq!(obs.bytes, (request.len() + response.len()) as u64);
+            assert_stalled_sample_is_slow(&obs, wait);
+            assert!(observations.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn clean_close_includes_time_after_the_last_write() {
+        let (handle, mut observations) = crate::pool::test_support::observer();
+        let (mut client, gate_client) = tokio::io::duplex(128);
+        let (gate_upstream, mut upstream) = tokio::io::duplex(128);
+        let worker = tokio::spawn(async move {
+            splice(
+                gate_client,
+                gate_upstream,
+                Duration::ZERO,
+                Some((&handle, "127.0.0.1".parse().unwrap())),
+            )
+            .await
+        });
+        upstream.write_all(b"response").await.unwrap();
+        let mut received = [0; 8];
+        client.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"response");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        client.shutdown().await.unwrap();
+        upstream.shutdown().await.unwrap();
+        worker.await.unwrap().unwrap();
+        let obs = observations.try_recv().unwrap();
+        assert_eq!(obs.bytes, 8);
+        assert!(obs.elapsed >= Duration::from_millis(40));
+        assert!(observations.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn empty_transfers_do_not_create_observations() {
+        let (handle, mut observations) = crate::pool::test_support::observer();
+        let (mut client, gate_client) = tokio::io::duplex(128);
+        let (gate_upstream, mut upstream) = tokio::io::duplex(128);
+        client.shutdown().await.unwrap();
+        upstream.shutdown().await.unwrap();
+        splice(
+            gate_client,
+            gate_upstream,
+            Duration::ZERO,
+            Some((&handle, "127.0.0.1".parse().unwrap())),
+        )
+        .await
+        .unwrap();
+        assert!(observations.try_recv().is_err());
+    }
+
+    struct PartialFailure {
+        remaining: usize,
+        delay: Duration,
+        error_after: Option<Pin<Box<tokio::time::Sleep>>>,
+    }
+
+    impl AsyncRead for PartialFailure {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut TaskContext<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for PartialFailure {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.remaining == 0 {
+                let delay = self.delay;
+                let timer = self
+                    .error_after
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(delay)));
+                std::task::ready!(timer.as_mut().poll(cx));
+                return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+            }
+            let n = self.remaining.min(buf.len());
+            self.remaining -= n;
+            Poll::Ready(Ok(n))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn write_failure_keeps_partial_bytes_and_wait_without_waiting_for_peer_eof() {
+        let (handle, mut observations) = crate::pool::test_support::observer();
+        let (mut client, gate_client) = tokio::io::duplex(128);
+        client.write_all(b"partially delivered").await.unwrap();
+        let failed = PartialFailure {
+            remaining: 7,
+            delay: Duration::from_millis(40),
+            error_after: None,
+        };
+        let result = timeout(
+            Duration::from_secs(2),
+            splice(
+                gate_client,
+                failed,
+                Duration::ZERO,
+                Some((&handle, "127.0.0.1".parse().unwrap())),
+            ),
+        )
+        .await
+        .expect("I/O failure must finish even if the opposite reader never closes");
+        assert_eq!(
+            result
+                .unwrap_err()
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        let obs = observations.try_recv().unwrap();
+        assert_eq!(obs.bytes, 7);
+        assert!(obs.elapsed >= Duration::from_millis(40));
+        assert!(observations.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn partial_write_before_error_is_counted_exactly() {
+        let mut reader = &b"partially delivered"[..];
+        let mut writer = PartialFailure {
+            remaining: 7,
+            delay: Duration::ZERO,
+            error_after: None,
+        };
+        let mut bytes = 0;
+        assert!(
+            pump(&mut reader, &mut writer, &Notify::new(), &mut bytes, true)
+                .await
+                .is_err()
+        );
+        assert_eq!(bytes, 7);
     }
 }

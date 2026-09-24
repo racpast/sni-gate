@@ -30,6 +30,9 @@
 //!   TLS. A startup probe (`src/probe.rs`) validates that the backend really
 //!   speaks h2c, but never silently downgrades the route.
 
+mod transfer;
+use transfer::splice;
+
 use std::net::SocketAddr;
 use std::pin::pin;
 use std::sync::Arc;
@@ -39,7 +42,7 @@ use anyhow::{anyhow, Context, Result};
 use rustls::client::EchStatus;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ServerConfig};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 use tokio_rustls::{LazyConfigAcceptor, TlsConnector};
@@ -570,20 +573,8 @@ async fn serve_mirrored(
 
     let tls = start.into_stream(config).await?;
 
-    // Extract upstream address before moving streams into splice
-    let upstream_addr = up.get_ref().0.peer_addr().ok();
-    let start_time = std::time::Instant::now();
-    let result = splice(tls, up, rt.idle_timeout).await;
-
-    // Report passive throughput observation to pool
-    if let (Ok((bytes_c2u, bytes_u2c)), Some(addr)) = (&result, upstream_addr) {
-        if let Upstream::Pool(handle) = &rt.upstream {
-            let elapsed = start_time.elapsed();
-            let total_bytes = bytes_c2u + bytes_u2c;
-            handle.observe_transfer(addr.ip(), total_bytes, elapsed);
-        }
-    }
-    result.map(|_| ())
+    let observer = transfer_observer(rt, up.get_ref().0.peer_addr().ok());
+    splice(tls, up, rt.idle_timeout, observer).await
 }
 
 /// Forward a cleartext inbound connection (no inbound TLS).
@@ -618,17 +609,8 @@ where
     match rt.route_type {
         RouteType::Http => {
             let up = dial(upstream_addrs, rt.connect_timeout).await?;
-            let upstream_addr = up.peer_addr().ok();
-            let start_time = std::time::Instant::now();
-            let result = splice(inbound, up, rt.idle_timeout).await;
-            if let (Ok((bytes_c2u, bytes_u2c)), Some(addr)) = (&result, upstream_addr) {
-                if let Upstream::Pool(handle) = &rt.upstream {
-                    let elapsed = start_time.elapsed();
-                    let total_bytes = bytes_c2u + bytes_u2c;
-                    handle.observe_transfer(addr.ip(), total_bytes, elapsed);
-                }
-            }
-            result.map(|_| ())
+            let observer = transfer_observer(rt, up.peer_addr().ok());
+            splice(inbound, up, rt.idle_timeout, observer).await
         }
         // These arms are only reached on the non-mirrored path (HTTP/2 disabled),
         // where inbound was negotiated as http/1.1 — so offer nothing upstream
@@ -640,33 +622,15 @@ where
             // later connection for the same name can, and this is a free look at
             // what the upstream's certificate covers.
             record_upstream_coverage(state, rt, sni.as_ref(), up.get_ref().1);
-            let upstream_addr = up.get_ref().0.peer_addr().ok();
-            let start_time = std::time::Instant::now();
-            let result = splice(inbound, up, rt.idle_timeout).await;
-            if let (Ok((bytes_c2u, bytes_u2c)), Some(addr)) = (&result, upstream_addr) {
-                if let Upstream::Pool(handle) = &rt.upstream {
-                    let elapsed = start_time.elapsed();
-                    let total_bytes = bytes_c2u + bytes_u2c;
-                    handle.observe_transfer(addr.ip(), total_bytes, elapsed);
-                }
-            }
-            result.map(|_| ())
+            let observer = transfer_observer(rt, up.get_ref().0.peer_addr().ok());
+            splice(inbound, up, rt.idle_timeout, observer).await
         }
         RouteType::Ech => {
             let inner = ech_inner_name(rt, &sni)?;
             let up = dial_ech(upstream_addrs, &inner, peer, rt, &[]).await?;
             record_upstream_coverage(state, rt, sni.as_ref(), up.get_ref().1);
-            let upstream_addr = up.get_ref().0.peer_addr().ok();
-            let start_time = std::time::Instant::now();
-            let result = splice(inbound, up, rt.idle_timeout).await;
-            if let (Ok((bytes_c2u, bytes_u2c)), Some(addr)) = (&result, upstream_addr) {
-                if let Upstream::Pool(handle) = &rt.upstream {
-                    let elapsed = start_time.elapsed();
-                    let total_bytes = bytes_c2u + bytes_u2c;
-                    handle.observe_transfer(addr.ip(), total_bytes, elapsed);
-                }
-            }
-            result.map(|_| ())
+            let observer = transfer_observer(rt, up.get_ref().0.peer_addr().ok());
+            splice(inbound, up, rt.idle_timeout, observer).await
         }
         RouteType::Raw => unreachable!("raw handled before termination"),
     }
@@ -945,84 +909,18 @@ fn is_ech_reject(e: &std::io::Error) -> bool {
     crate::ech::is_ech_reject_io(e)
 }
 
-/// Splice bytes bidirectionally, enforcing a true **idle** timeout: the clock
-/// resets on every chunk in either direction, so long-lived but active
-/// connections (WebSocket, streaming) are never cut — only genuinely idle ones.
-/// `idle` of zero disables the timeout.
-///
-/// Both directions are driven to completion independently (a half-close in one
-/// direction does not tear down the other), so request/response and duplex
-/// protocols both work. The splice ends when both directions have closed, or
-/// when the idle timeout fires, whichever comes first.
-///
-/// Returns `(bytes_a_to_b, bytes_b_to_a)` on success.
-async fn splice<A, B>(a: A, b: B, idle: Duration) -> Result<(u64, u64)>
-where
-    A: AsyncRead + AsyncWrite + Unpin,
-    B: AsyncRead + AsyncWrite + Unpin,
-{
-    let (mut ar, mut aw) = tokio::io::split(a);
-    let (mut br, mut bw) = tokio::io::split(b);
-    let activity = Arc::new(tokio::sync::Notify::new());
-
-    // Run both directions to completion; only the idle guard races them.
-    let both = async {
-        let a2b = pump_direction(&mut ar, &mut bw, &activity);
-        let b2a = pump_direction(&mut br, &mut aw, &activity);
-        let (r1, r2) = tokio::join!(a2b, b2a);
-        let bytes_a2b = r1.context("proxying data (c->u)")?;
-        let bytes_b2a = r2.context("proxying data (u->c)")?;
-        Ok::<(u64, u64), anyhow::Error>((bytes_a2b, bytes_b2a))
+/// Observation is opt-in, avoiding per-write counters and clock reads when disabled.
+fn transfer_observer(
+    rt: &RouteRuntime,
+    addr: Option<SocketAddr>,
+) -> Option<(&PoolHandle, std::net::IpAddr)> {
+    let Upstream::Pool(handle) = &rt.upstream else {
+        return None;
     };
-
-    tokio::select! {
-        r = both => r,
-        _ = idle_guard(&activity, idle) => Err(anyhow!("idle timeout")),
+    if !handle.observes_transfers() {
+        return None;
     }
-}
-
-/// Copy one direction, signaling `activity` on every chunk. On EOF it
-/// half-closes the writer (so the peer sees the close) and returns the total
-/// bytes transferred, leaving the other direction free to continue.
-async fn pump_direction<R, W>(
-    reader: &mut R,
-    writer: &mut W,
-    activity: &tokio::sync::Notify,
-) -> Result<u64>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    use tokio::io::AsyncReadExt;
-    let mut buf = vec![0u8; COPY_BUF_SIZE];
-    let mut total = 0u64;
-    loop {
-        let n = reader.read(&mut buf).await?;
-        if n == 0 {
-            let _ = writer.shutdown().await;
-            return Ok(total);
-        }
-        writer.write_all(&buf[..n]).await?;
-        total += n as u64;
-        activity.notify_one();
-    }
-}
-
-/// Resolve only when no activity has been signaled for `idle`. Never resolves
-/// when `idle` is zero (timeout disabled). `Notify` holds a single permit, so a
-/// notification arriving between `.notified()` awaits is not lost — it is
-/// consumed by the next await, correctly resetting the clock.
-async fn idle_guard(activity: &tokio::sync::Notify, idle: Duration) {
-    if idle.is_zero() {
-        std::future::pending::<()>().await;
-        return;
-    }
-    loop {
-        match timeout(idle, activity.notified()).await {
-            Ok(()) => continue, // activity: reset the idle clock
-            Err(_) => return,   // no activity within `idle`: time out
-        }
-    }
+    Some((handle, addr?.ip()))
 }
 
 /// Raw byte-pump passthrough (no termination, no cert). Because nothing is
@@ -1046,28 +944,14 @@ async fn raw_passthrough(
 
     match dialed {
         Ok(up) => {
-            let upstream_addr = up.peer_addr().ok();
-            let start_time = std::time::Instant::now();
-            let result = splice_tcp(client, up, rt.idle_timeout).await;
-            if let (Ok((bytes_c2u, bytes_u2c)), Some(addr)) = (&result, upstream_addr) {
-                if let Upstream::Pool(handle) = &rt.upstream {
-                    let elapsed = start_time.elapsed();
-                    let total_bytes = bytes_c2u + bytes_u2c;
-                    handle.observe_transfer(addr.ip(), total_bytes, elapsed);
-                }
-            }
-            result.map(|_| ())
+            let observer = transfer_observer(rt, up.peer_addr().ok());
+            splice(client, up, rt.idle_timeout, observer).await
         }
         Err(e) => {
             debug!(%peer, route = %rt.name, error = %format!("{e:#}"), "raw upstream failed; applying fail policy");
             apply_fail(client, peer, inbound, &rt.fail, "raw-fail").await
         }
     }
-}
-
-/// Raw TCP splice with the same true-idle-timeout semantics as [`splice`].
-async fn splice_tcp(a: TcpStream, b: TcpStream, idle: Duration) -> Result<(u64, u64)> {
-    splice(a, b, idle).await
 }
 
 /// Apply a fail/unmatched policy to a never-decrypted stream.
@@ -1085,9 +969,7 @@ async fn apply_fail(
         }
         FailPolicy::Passthrough { addr } => {
             let up = dial(ResolvedAddrs::single(*addr), Duration::from_secs(10)).await?;
-            splice_tcp(client, up, Duration::from_secs(120))
-                .await
-                .map(|_| ())
+            splice(client, up, Duration::from_secs(120), None).await
         }
         FailPolicy::SystemOutbound => {
             let host = inbound
@@ -1097,9 +979,7 @@ async fn apply_fail(
             let host = strip_port(host);
             let up = TcpStream::connect((host.as_str(), port)).await?;
             up.set_nodelay(true).ok();
-            splice_tcp(client, up, Duration::from_secs(120))
-                .await
-                .map(|_| ())
+            splice(client, up, Duration::from_secs(120), None).await
         }
     }
 }
@@ -1239,9 +1119,7 @@ mod tests {
 
         // splice() bridges the two gate ends.
         let spliced = tokio::spawn(async move {
-            splice(client_gate, upstream_gate, Duration::from_secs(5))
-                .await
-                .map(|_| ())
+            splice(client_gate, upstream_gate, Duration::from_secs(5), None).await
         });
 
         let big = vec![0xABu8; 256 * 1024];

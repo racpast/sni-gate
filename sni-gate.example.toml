@@ -511,13 +511,14 @@ connect_timeout = "5s"
 # targets = ["cdn-a.example.com", "cdn-b.example.com", "cdn-c.example.com"]
 #
 #   [pools.cdn-adaptive.probe]
-#   mode = "https"
-#   url = "https://${TARGET}/health"
+#   mode = "http"
+#   url = "https://media.example.com/health"
+#   expect_status = [200]
 #   interval = "5m"
 #   # Enable throughput-aware routing (0 = pure RTT, the default)
 #   score_payload_bytes = 1_000_000      # 1 MB reference payload
 #                                        # 100_000 for images, 10_000_000 for video
-#   # NIG time-discount factor (0.0-1.0). Higher = retain old observations longer.
+#   # NIG observation discount in (0,1]. Higher retains older evidence longer.
 #   throughput_discount = 0.95           # default: 0.95
 #                                        # 0.98 for stable, 0.90 for bursty
 #   # Kalman process noise (ms²). Higher = faster adaptation to routing changes.
@@ -526,7 +527,7 @@ connect_timeout = "5s"
 #   # Kalman observation noise (ms²). Expected probe measurement variance.
 #   rtt_obs_noise = 0.1                  # default: 0.1
 #                                        # 0.05 low-jitter, 0.5 high-jitter
-#   # Concurrent probes per cycle
+#   # Concurrent probes per cycle (1..4096)
 #   max_concurrent_probes = 32           # default: 16
 #                                        # 8 for small pools, 64 for large
 #
@@ -534,5 +535,4 @@ connect_timeout = "5s"
 # uses Thompson Sampling to balance exploitation (route to known-good) with
 # exploration (discover better alternatives). Candidates are grouped by /24 (IPv4)
 # or /48 (IPv6) subnet, so observations on one candidate improve estimates for
-# siblings. See docs/pools.md for details.
-
+# siblings.

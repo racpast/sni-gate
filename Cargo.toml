@@ -36,9 +36,10 @@ x509-parser = "0.18"
 regex = "1"
 publicsuffix = "2"
 
-# Upstream pools: CIDR target expansion + random sampling of candidate addresses.
+# Upstream pools: CIDR sampling and posterior throughput distributions.
 ipnet = "2"
 rand = "0.10"
+rand_distr = "0.6"
 
 # In-memory caches (issued certs, per-inner ECH configs).
 moka = { version = "0.12", features = ["sync"] }
